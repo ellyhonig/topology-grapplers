@@ -309,7 +309,7 @@
 	function projectBendPlanes(position, reference, pinned) {
 		var pins = pinnedJointMap(pinned);
 		twoBoneDefs().forEach(function (limb) {
-			if (pins[limb.player + ":" + limb.mid]) return;
+			if (pins[limb.player + ":" + limb.root] || pins[limb.player + ":" + limb.mid] || pins[limb.player + ":" + limb.tip]) return;
 			var p = position[limb.player];
 			var r = reference[limb.player];
 			var root = p[limb.root];
@@ -337,6 +337,13 @@
 			bendDir = bendDir.normalize();
 			var targetMid = root.add(axis.scale(x)).add(bendDir.scale(bendRadius));
 			p[limb.mid] = currentMid.add(clampVector(targetMid.subtract(currentMid), maxBendProjectionStep));
+		});
+	}
+
+	function forcePinnedPositions(position, pinned) {
+		(pinned || []).forEach(function (pin) {
+			if (!pin.position) return;
+			position[pin.player][pin.joint] = pin.position.clone();
 		});
 	}
 
@@ -1085,20 +1092,25 @@
 		var chainA = selectedChain(el.chainA);
 		var chainB = selectedChain(el.chainB);
 		var previous = clonePosition(currentPosition);
-		var previousClearance = measureAllMinClearance(previous);
 		var p = clonePosition(currentPosition);
 		var grabbed = p[drag.player][drag.joint];
 		var delta = drag.target.subtract(grabbed);
 		var deltaLen = delta.length();
 		if (deltaLen > maxDragStep) delta = delta.scale(maxDragStep / deltaLen);
-		p[drag.player][drag.joint] = grabbed.add(delta);
-		p[drag.player][drag.joint].y = Math.max(0.02, p[drag.player][drag.joint].y);
+		var draggedPosition = grabbed.add(delta);
+		draggedPosition.y = Math.max(0.02, draggedPosition.y);
+		p[drag.player][drag.joint] = draggedPosition;
 
-		var pin = { player: drag.player, joint: drag.joint };
+		var pin = { player: drag.player, joint: drag.joint, position: draggedPosition };
+		var pins = [pin];
 		projectBodyLengths(p, drag.lengths, [pin]);
+		forcePinnedPositions(p, pins);
 		projectBendPlanes(p, drag.referencePosition, [pin]);
-		relaxAllContacts(p, drag.lengths, [pin], 2);
+		forcePinnedPositions(p, pins);
+		relaxAllContacts(p, drag.lengths, pins, 2);
+		forcePinnedPositions(p, pins);
 		projectBendPlanes(p, drag.referencePosition, [pin]);
+		forcePinnedPositions(p, pins);
 		var current = writheMatrix(p, chainA, chainB);
 		var desired = steppedMatrix(current, drag.topologyMatrix, maxMatrixStep);
 		var solved = solveToward(p, chainA, chainB, desired, {
@@ -1111,18 +1123,21 @@
 
 		p = solved.position;
 		projectBodyLengths(p, drag.lengths, [pin]);
+		forcePinnedPositions(p, pins);
 		projectBendPlanes(p, drag.referencePosition, [pin]);
-		var projectionProof = relaxAllContacts(p, drag.lengths, [pin], 5);
+		forcePinnedPositions(p, pins);
+		var projectionProof = relaxAllContacts(p, drag.lengths, pins, 5);
+		forcePinnedPositions(p, pins);
 		projectBendPlanes(p, drag.referencePosition, [pin]);
+		forcePinnedPositions(p, pins);
 		projectBodyLengths(p, drag.lengths, [pin]);
-		limitUnpinnedFrameMotion(p, previous, [pin]);
+		forcePinnedPositions(p, pins);
+		limitUnpinnedFrameMotion(p, previous, pins);
+		forcePinnedPositions(p, pins);
 		mergeProofs(solved.proof, projectionProof);
 
 		var nextClearance = measureAllMinClearance(p);
-		if (nextClearance < -0.001 && nextClearance < previousClearance - 0.002) {
-			p = previous;
-			solved.proof.minClearance = Math.min(solved.proof.minClearance, nextClearance);
-		}
+		solved.proof.minClearance = Math.min(solved.proof.minClearance, nextClearance);
 
 		currentPosition = p;
 		contactProof = solved.proof || emptyContactProof();
