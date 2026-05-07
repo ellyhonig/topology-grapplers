@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>GrappleMap Topology Coordinates Demo</title>
+	<link rel="stylesheet" href="topology-demo.css">
+	<script src="https://cdn.babylonjs.com/babylon.js"></script>
+	<script src="gm.js"></script>
+</head>
+<body>
+	<main class="app">
+		<section class="viewport">
+			<canvas id="renderCanvas"></canvas>
+			<div class="overlay">
+				<div class="metric"><span>Current writhe</span><strong id="currentWrithe">0.000</strong></div>
+				<div class="metric"><span>Target writhe</span><strong id="targetWrithe">0.000</strong></div>
+				<div class="metric"><span>Residual</span><strong id="residual">0.000</strong></div>
+				<div class="metric"><span>Solver step</span><strong id="solverStep">0</strong></div>
+				<div class="metric"><span>Contact projections</span><strong id="contactProjectionCount">0</strong></div>
+				<div class="metric"><span>Min clearance</span><strong id="minClearance">0.000</strong></div>
+				<div class="metric"><span>Drag control</span><strong id="dragStatus">none</strong></div>
+			</div>
+		</section>
+
+		<aside class="controls">
+			<header>
+				<h1>Topology Coordinates</h1>
+				<p>Drag a joint in the viewport. The grabbed joint is the input; topology coordinates, bone lengths, and contact projection control the rest.</p>
+			</header>
+
+			<label class="field">
+				<span>GrappleMap position</span>
+				<select id="positionSelect"></select>
+			</label>
+
+			<div class="two">
+				<label class="field">
+					<span>Chain A</span>
+					<select id="chainA"></select>
+				</label>
+				<label class="field">
+					<span>Chain B</span>
+					<select id="chainB"></select>
+				</label>
+			</div>
+
+			<fieldset>
+				<legend>Affected limbs</legend>
+				<label><input type="checkbox" id="affectA" checked> slider moves A</label>
+				<label><input type="checkbox" id="affectB"> slider moves B</label>
+			</fieldset>
+
+			<label class="range">
+				<span>Writhe <output id="writheOut"></output></span>
+				<input id="writhe" type="range" min="-1.5" max="1.5" value="0.45" step="0.01">
+			</label>
+			<label class="range">
+				<span>Density <output id="densityOut"></output></span>
+				<input id="density" type="range" min="-0.785" max="0.785" value="-0.35" step="0.005">
+			</label>
+			<label class="range">
+				<span>Center A <output id="centerAOut"></output></span>
+				<input id="centerA" type="range" min="-1" max="1" value="0" step="0.01">
+			</label>
+			<label class="range">
+				<span>Center B <output id="centerBOut"></output></span>
+				<input id="centerB" type="range" min="-1" max="1" value="0" step="0.01">
+			</label>
+			<label class="range">
+				<span>Auto steps <output id="framesOut"></output></span>
+				<input id="frames" type="range" min="32" max="240" value="120" step="1">
+			</label>
+
+			<div class="buttons">
+				<button id="resetBtn" type="button">Reset pose</button>
+			</div>
+
+			<section class="proof">
+				<h2>Implementation proof</h2>
+				<p class="legend-line"><span class="swatch rejected"></span> rejected crossing vector <span class="swatch projected"></span> projected kosher contact vector</p>
+				<div class="proof-grid">
+					<div>
+						<h3>Current writhe matrix</h3>
+						<canvas id="currentMatrix" width="180" height="180"></canvas>
+					</div>
+					<div>
+						<h3>Desired writhe matrix</h3>
+						<canvas id="desiredMatrix" width="180" height="180"></canvas>
+					</div>
+				</div>
+				<pre id="proofLog"></pre>
+			</section>
+		</aside>
+	</main>
+	<script src="topology-demo.js?v=stable-steps-2"></script>
+</body>
+</html>

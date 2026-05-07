@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>GrappleMap Agent Project Portfolio</title>
+	<link rel="stylesheet" href="project-portfolio.css">
+</head>
+<body>
+	<header class="hero">
+		<nav>
+			<a href="../KNOWLEDGE_BASE.md">Knowledge Base</a>
+			<a href="../KNOWLEDGE_BASE_TOPOLOGY_COORDINATES.md">Paper Node</a>
+			<a href="topology-demo.html">Topology Demo</a>
+		</nav>
+		<div>
+			<p class="eyebrow">Agent build log</p>
+			<h1>GrappleMap Topology Coordinates Portfolio</h1>
+			<p class="summary">
+				A concise map of the project-tree nodes, what each one contributed, and how the research was turned into a runnable GrappleMap animation demo.
+			</p>
+		</div>
+	</header>
+
+	<main>
+		<section class="overview" aria-label="Project overview">
+			<div class="stat">
+				<strong>2,086</strong>
+				<span>decoded GrappleMap position nodes</span>
+			</div>
+			<div class="stat">
+				<strong>23</strong>
+				<span>joints per player skeleton</span>
+			</div>
+			<div class="stat">
+				<strong>3</strong>
+				<span>topology controls: writhe, center, density</span>
+			</div>
+			<div class="stat">
+				<strong>1</strong>
+				<span>browser demo with visual proof</span>
+			</div>
+		</section>
+
+		<section class="workspace">
+			<aside class="tree" aria-label="Project tree">
+				<h2>Project Tree</h2>
+				<div id="treeNodes"></div>
+			</aside>
+
+			<section class="detail" aria-live="polite">
+				<div class="detail-head">
+					<p id="nodeType" class="eyebrow"></p>
+					<h2 id="nodeTitle"></h2>
+					<p id="nodeSummary"></p>
+				</div>
+
+				<div class="detail-grid">
+					<div>
+						<h3>Pieces Used</h3>
+						<ul id="nodePieces"></ul>
+					</div>
+					<div>
+						<h3>Process Role</h3>
+						<ul id="nodeProcess"></ul>
+					</div>
+				</div>
+
+				<div class="artifact-row" id="nodeArtifacts"></div>
+			</section>
+		</section>
+
+		<section class="timeline">
+			<h2>Process</h2>
+			<div class="steps">
+				<article>
+					<span>01</span>
+					<h3>Read The Codebase</h3>
+					<p>Mapped GrappleMap's parser, graph model, position encoding, browser renderer, and editor architecture.</p>
+				</article>
+				<article>
+					<span>02</span>
+					<h3>Extract The Paper Method</h3>
+					<p>Converted topology coordinates into implementable components: segment GLI, writhe matrix, center, density, desired matrix, and solver loop.</p>
+				</article>
+				<article>
+					<span>03</span>
+					<h3>Build The Demo</h3>
+					<p>Created a browser page that loads GrappleMap positions, selects chains, synthesizes frames, and draws proof heatmaps.</p>
+				</article>
+				<article>
+					<span>04</span>
+					<h3>Verify Visually</h3>
+					<p>Rendered screenshots from headless Chrome showing the loaded skeletons, selected controls, matrices, residual, and solver step count.</p>
+				</article>
+			</div>
+		</section>
+
+		<section class="gallery">
+			<h2>Proof Artifacts</h2>
+			<div class="shots">
+				<a href="../topology-demo-proof.png">
+					<img src="../topology-demo-proof.png" alt="Topology demo proof screenshot before synthesis">
+					<span>Initial matrix proof</span>
+				</a>
+				<a href="../topology-demo-proof-autosynth.png">
+					<img src="../topology-demo-proof-autosynth.png" alt="Topology demo proof screenshot after automatic synthesis">
+					<span>Autosynth proof</span>
+				</a>
+			</div>
+		</section>
+	</main>
+
+	<script src="project-portfolio.js"></script>
+</body>
+</html>
