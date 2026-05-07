@@ -38,6 +38,8 @@
 	var maxDragStep = 0.035;
 	var maxLengthProjectionStep = 0.022;
 	var maxContactProjectionStep = 0.026;
+	var maxUnpinnedJointFrameStep = 0.055;
+	var maxBendProjectionStep = 0.03;
 	var minAcceptedClearance = 0.035;
 	var contactProof = emptyContactProof();
 	var proofMeshes = [];
@@ -287,6 +289,64 @@
 					position[seg.player][seg.from] = a.add(correction.scale(0.5));
 					position[seg.player][seg.to] = b.subtract(correction.scale(0.5));
 				}
+			}
+		}
+	}
+
+	function twoBoneDefs() {
+		return [
+			{ player: 0, root: LeftHip, mid: LeftKnee, tip: LeftAnkle },
+			{ player: 0, root: RightHip, mid: RightKnee, tip: RightAnkle },
+			{ player: 1, root: LeftHip, mid: LeftKnee, tip: LeftAnkle },
+			{ player: 1, root: RightHip, mid: RightKnee, tip: RightAnkle },
+			{ player: 0, root: LeftShoulder, mid: LeftElbow, tip: LeftWrist },
+			{ player: 0, root: RightShoulder, mid: RightElbow, tip: RightWrist },
+			{ player: 1, root: LeftShoulder, mid: LeftElbow, tip: LeftWrist },
+			{ player: 1, root: RightShoulder, mid: RightElbow, tip: RightWrist }
+		];
+	}
+
+	function projectBendPlanes(position, reference, pinned) {
+		var pins = pinnedJointMap(pinned);
+		twoBoneDefs().forEach(function (limb) {
+			if (pins[limb.player + ":" + limb.mid]) return;
+			var p = position[limb.player];
+			var r = reference[limb.player];
+			var root = p[limb.root];
+			var tip = p[limb.tip];
+			var currentMid = p[limb.mid];
+			var rootTip = tip.subtract(root);
+			var d = rootTip.length();
+			var l1 = dist(r[limb.root], r[limb.mid]);
+			var l2 = dist(r[limb.mid], r[limb.tip]);
+			if (d < 1e-6 || l1 < 1e-6 || l2 < 1e-6) return;
+			var axis = rootTip.scale(1 / d);
+			var x = clamp((l1 * l1 - l2 * l2 + d * d) / (2 * d), 0, d);
+			var h2 = Math.max(0, l1 * l1 - x * x);
+			var bendRadius = Math.sqrt(h2);
+			var refAxis = r[limb.tip].subtract(r[limb.root]);
+			var refLen = refAxis.length();
+			if (refLen < 1e-6) return;
+			refAxis = refAxis.scale(1 / refLen);
+			var refBend = r[limb.mid].subtract(r[limb.root]).subtract(refAxis.scale(dot(r[limb.mid].subtract(r[limb.root]), refAxis)));
+			var bendDir = refBend.subtract(axis.scale(dot(refBend, axis)));
+			if (bendDir.length() < 1e-6) {
+				bendDir = currentMid.subtract(root).subtract(axis.scale(dot(currentMid.subtract(root), axis)));
+			}
+			if (bendDir.length() < 1e-6) return;
+			bendDir = bendDir.normalize();
+			var targetMid = root.add(axis.scale(x)).add(bendDir.scale(bendRadius));
+			p[limb.mid] = currentMid.add(clampVector(targetMid.subtract(currentMid), maxBendProjectionStep));
+		});
+	}
+
+	function limitUnpinnedFrameMotion(position, previous, pinned) {
+		var pins = pinnedJointMap(pinned);
+		for (var player = 0; player < 2; ++player) {
+			for (var joint = 0; joint < jointNames.length; ++joint) {
+				if (pins[player + ":" + joint]) continue;
+				var prev = previous[player][joint];
+				position[player][joint] = prev.add(clampVector(position[player][joint].subtract(prev), maxUnpinnedJointFrameStep));
 			}
 		}
 	}
@@ -999,6 +1059,7 @@
 			offset: v3(0, 0, 0),
 			plane: BABYLON.Plane.FromPositionAndNormal(origin, normal),
 			topologyMatrix: writheMatrix(currentPosition, chainA, chainB),
+			referencePosition: clonePosition(currentPosition),
 			lengths: segmentLengthsFrom(currentPosition)
 		};
 		syncDragTargetFromPointer();
@@ -1035,7 +1096,9 @@
 
 		var pin = { player: drag.player, joint: drag.joint };
 		projectBodyLengths(p, drag.lengths, [pin]);
+		projectBendPlanes(p, drag.referencePosition, [pin]);
 		relaxAllContacts(p, drag.lengths, [pin], 2);
+		projectBendPlanes(p, drag.referencePosition, [pin]);
 		var current = writheMatrix(p, chainA, chainB);
 		var desired = steppedMatrix(current, drag.topologyMatrix, maxMatrixStep);
 		var solved = solveToward(p, chainA, chainB, desired, {
@@ -1048,7 +1111,11 @@
 
 		p = solved.position;
 		projectBodyLengths(p, drag.lengths, [pin]);
+		projectBendPlanes(p, drag.referencePosition, [pin]);
 		var projectionProof = relaxAllContacts(p, drag.lengths, [pin], 5);
+		projectBendPlanes(p, drag.referencePosition, [pin]);
+		projectBodyLengths(p, drag.lengths, [pin]);
+		limitUnpinnedFrameMotion(p, previous, [pin]);
 		mergeProofs(solved.proof, projectionProof);
 
 		var nextClearance = measureAllMinClearance(p);
@@ -1235,8 +1302,8 @@
 			"Drag mode: clicked joint is a hard real-time control input; the solver preserves the topology matrix captured at pointer-down.",
 			"Slider mode: vertical unit matrix, density rotation, center translation, scaled by target writhe.",
 			"Generalized-coordinate solve: damped linearized QP/least-squares solve on ||J*dq-(Td-T)||^2 with per-frame target clamping and bone-length projection.",
-			"Character control projection: every drag frame pins the grabbed joint, restores all GrappleMap body segment lengths, then projects every non-adjacent limb capsule pair along the nearest valid normal.",
-			"Step bounds: each frame can change a writhe-matrix cell by at most " + fmt(maxMatrixStep) + ", each joint axis by at most " + fmt(maxJointStep) + " meters, and each collision/length projection is capped.",
+			"Character control projection: every drag frame pins the grabbed joint, restores all GrappleMap body segment lengths, preserves knee/elbow bend planes, then projects every non-adjacent limb capsule pair along the nearest valid normal.",
+			"Step bounds: each frame can change a writhe-matrix cell by at most " + fmt(maxMatrixStep) + ", each joint axis by at most " + fmt(maxJointStep) + " meters, each unpinned joint by at most " + fmt(maxUnpinnedJointFrameStep) + " meters, and each collision/length projection is capped.",
 			"Visual proof: orange lines are rejected attempted vectors; green lines are the projected kosher vectors that replace them.",
 			"Contact projections=" + (contactProof.count || 0) + ", accepted min clearance=" + fmt(acceptedClearance) + ".",
 			"Selected chains: " + chainA.label + " vs " + chainB.label + "."
