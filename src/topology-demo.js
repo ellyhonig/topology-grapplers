@@ -215,9 +215,11 @@
 
 	function selectedChainBodySegments(position, chain) {
 		var out = [];
-		for (var i = 0; i < chain.joints.length - 1; ++i) {
-			var from = chain.joints[i];
-			var to = chain.joints[i + 1];
+		var seen = {};
+		function pushSegment(from, to) {
+			var key = segmentKey(chain.player, from, to);
+			if (seen[key]) return;
+			seen[key] = true;
 			out.push({
 				player: chain.player,
 				from: from,
@@ -225,8 +227,17 @@
 				a: position[chain.player][from],
 				b: position[chain.player][to],
 				radius: Math.max(joints[from][0], joints[to][0], 0.035),
-				key: segmentKey(chain.player, from, to)
+				key: key
 			});
+		}
+		for (var i = 0; i < chain.joints.length - 1; ++i) {
+			pushSegment(chain.joints[i], chain.joints[i + 1]);
+		}
+		var side = footSideForChain(chain);
+		if (side) {
+			pushSegment(side.ankle, side.toe);
+			pushSegment(side.ankle, side.heel);
+			pushSegment(side.toe, side.heel);
 		}
 		return out;
 	}
@@ -281,14 +292,59 @@
 		return null;
 	}
 
+	function legSideForChain(chain) {
+		if (!chain) return null;
+		if (chain.footSide) return chain.footSide;
+		for (var i = 0; i < chain.joints.length; ++i) {
+			var side = legSideForJoint(chain.joints[i]);
+			if (side) return side;
+		}
+		return null;
+	}
+
 	function isLegChain(chain) {
-		return chain && (chain.joints[0] === LeftHip || chain.joints[0] === RightHip);
+		return !!legSideForChain(chain);
+	}
+
+	function reversedDragChain(chain) {
+		var reversed = {
+			id: chain.id + "-reverse",
+			label: chain.label + " reverse path",
+			player: chain.player,
+			joints: chain.joints.slice().reverse()
+		};
+		var side = legSideForChain(chain);
+		if (side) reversed.footSide = side;
+		return reversed;
+	}
+
+	function rootParentJoint(joint) {
+		if (joint === LeftShoulder || joint === RightShoulder || joint === LeftHip || joint === RightHip) return Core;
+		return null;
+	}
+
+	function torsoAnchoredDragChain(chain, parent) {
+		var anchored = {
+			id: chain.id + "-torso-anchor",
+			label: chain.label + " torso anchored path",
+			player: chain.player,
+			joints: [parent].concat(chain.joints),
+			projectBody: true
+		};
+		var side = legSideForChain(chain);
+		if (side) anchored.footSide = side;
+		return anchored;
 	}
 
 	function dragChainForJoint(baseChain, player, joint) {
+		if (!baseChain || baseChain.player !== player) return baseChain;
+		if (chainJointIndex(baseChain, joint) === 0) {
+			var parent = rootParentJoint(joint);
+			return parent === null ? reversedDragChain(baseChain) : torsoAnchoredDragChain(baseChain, parent);
+		}
+
 		var side = legSideForJoint(joint);
-		if (!side || !baseChain || baseChain.player !== player) return baseChain;
-		if (joint !== side.heel) return baseChain;
+		if (!side || joint !== side.heel) return baseChain;
 		return {
 			id: baseChain.id + "-heel",
 			label: baseChain.label + " heel path",
@@ -312,8 +368,7 @@
 	}
 
 	function footSideForChain(chain) {
-		if (!isLegChain(chain)) return null;
-		return legSideForJoint(chain.joints[0]);
+		return legSideForChain(chain);
 	}
 
 	function solveTrianglePoint(a, b, la, lb, reference) {
@@ -1156,9 +1211,11 @@
 			var before = clonePosition(p);
 			projectAnchoredChainToTarget(p, chain, d.chainLengths, targetJoint, stepTarget);
 			projectFootTriangle(p, chain, d.footLengths, targetJoint, d.referencePosition);
+			if (d.bodyLengths) projectBodyLengths(p, d.bodyLengths, [chainRootPin(chain)]);
 			var passProof = projectContacts(before, p, [chain], dragMoveList([chain], null));
 			mergeProofs(proof, passProof);
 			projectSelectedLimbLengths(p, d);
+			if (d.bodyLengths) projectBodyLengths(p, d.bodyLengths, [chainRootPin(chain)]);
 		}
 		var clearance = measureMinClearance(p, [chain]);
 		proof.minClearance = Math.min(proof.minClearance, clearance);
@@ -1251,14 +1308,20 @@
 	function dragMoveList(chains, pin) {
 		var seen = {};
 		var out = [];
+		function add(player, joint) {
+			var key = player + ":" + joint;
+			if (pin && key === pin.player + ":" + pin.joint) return;
+			if (seen[key]) return;
+			seen[key] = true;
+			out.push({ player: player, joint: joint });
+		}
 		chains.forEach(function (chain) {
-			chain.joints.forEach(function (joint) {
-				var key = chain.player + ":" + joint;
-				if (pin && key === pin.player + ":" + pin.joint) return;
-				if (seen[key]) return;
-				seen[key] = true;
-				out.push({ player: chain.player, joint: joint });
-			});
+			chain.joints.forEach(function (joint) { add(chain.player, joint); });
+			var side = footSideForChain(chain);
+			if (side) {
+				add(chain.player, side.toe);
+				add(chain.player, side.heel);
+			}
 		});
 		return out;
 	}
@@ -1332,6 +1395,7 @@
 			topologyMatrix: writheMatrix(currentPosition, dragChain, topologyOther),
 			referencePosition: clonePosition(currentPosition),
 			chainLengths: chainLengths(currentPosition, dragChain),
+			bodyLengths: dragChain.projectBody ? segmentLengthsFrom(currentPosition) : null,
 			footLengths: footLengthsFrom(currentPosition, player, footSideForChain(dragChain)),
 			previewTick: 0
 		};
@@ -1355,6 +1419,21 @@
 		updateProof();
 	}
 
+	function commitDragStep(position, proof, grabbed, reached, clearance, lengthError) {
+		proof = proof || emptyContactProof();
+		proof.projected.push({ from: grabbed, to: reached });
+		proof.minClearance = Math.min(proof.minClearance, clearance);
+		proof.lengthError = lengthError;
+		currentPosition = position;
+		contactProof = proof;
+		updatePlayers(currentPosition);
+		updateHandles(currentPosition);
+		renderContactProof(contactProof);
+		drag.previewTick = (drag.previewTick || 0) + 1;
+		if (drag.previewTick % 4 === 0) renderKosherMovementArea();
+		updateProof();
+	}
+
 	function dragStep() {
 		if (!drag || !currentPosition) return;
 		var chainA = drag.chain;
@@ -1373,6 +1452,16 @@
 		var limbMove = dragMoveList([chainA], null);
 		var directProof = projectContacts(previous, p, [chainA], limbMove);
 		projectSelectedLimbLengths(p, drag);
+		if (drag.bodyLengths) projectBodyLengths(p, drag.bodyLengths, [chainRootPin(chainA)]);
+		var directCandidate = clonePosition(p);
+		var directClearance = measureMinClearance(directCandidate, [chainA]);
+		var directLengthError = maxChainLengthError(directCandidate, chainA, drag.chainLengths, drag.footLengths);
+		var directValid = directClearance >= -0.001 && directLengthError <= 0.002;
+		if (isLegChain(chainA) && directValid) {
+			directProof.rejected.push({ from: grabbed, to: draggedPosition });
+			commitDragStep(directCandidate, directProof, grabbed, directCandidate[drag.player][drag.joint], directClearance, directLengthError);
+			return;
+		}
 		var current = writheMatrix(p, chainA, chainB);
 		var desired = steppedMatrix(current, drag.topologyMatrix, maxMatrixStep);
 		var solved = solveToward(p, chainA, chainB, desired, {
@@ -1385,31 +1474,29 @@
 
 		p = solved.position;
 		projectSelectedLimbLengths(p, drag);
+		if (drag.bodyLengths) projectBodyLengths(p, drag.bodyLengths, [chainRootPin(chainA)]);
 		var projectionProof = relaxContacts(p, [chainA], drag.chainLengths, [chainRootPin(chainA)], 5);
 		projectSelectedLimbLengths(p, drag);
+		if (drag.bodyLengths) projectBodyLengths(p, drag.bodyLengths, [chainRootPin(chainA)]);
 		mergeProofs(solved.proof, directProof);
 		mergeProofs(solved.proof, projectionProof);
 
 		var nextClearance = measureMinClearance(p, [chainA]);
 		var lengthError = maxChainLengthError(p, chainA, drag.chainLengths, drag.footLengths);
+		var solvedTargetError = dist(p[drag.player][drag.joint], draggedPosition);
+		var directTargetError = dist(directCandidate[drag.player][drag.joint], draggedPosition);
+		var solvedValid = nextClearance >= -0.001 && lengthError <= 0.002 && solvedTargetError <= directTargetError + maxDragStep * 0.35;
 		solved.proof.rejected.push({ from: grabbed, to: draggedPosition });
-		if (nextClearance < -0.001 || lengthError > 0.002) {
+		if (!solvedValid && directValid) {
+			p = directCandidate;
+			nextClearance = directClearance;
+			lengthError = directLengthError;
+		} else if (!solvedValid) {
 			p = previous;
 			nextClearance = measureMinClearance(p, [chainA]);
 			lengthError = maxChainLengthError(p, chainA, drag.chainLengths, drag.footLengths);
 		}
-		solved.proof.projected.push({ from: grabbed, to: p[drag.player][drag.joint] });
-		solved.proof.minClearance = Math.min(solved.proof.minClearance, nextClearance);
-		solved.proof.lengthError = lengthError;
-
-		currentPosition = p;
-		contactProof = solved.proof || emptyContactProof();
-		updatePlayers(currentPosition);
-		updateHandles(currentPosition);
-		renderContactProof(contactProof);
-		drag.previewTick = (drag.previewTick || 0) + 1;
-		if (drag.previewTick % 4 === 0) renderKosherMovementArea();
-		updateProof();
+		commitDragStep(p, solved.proof, grabbed, p[drag.player][drag.joint], nextClearance, lengthError);
 	}
 
 	function installDragControls(canvas) {
