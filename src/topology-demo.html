@@ -26,7 +26,7 @@
 		<aside class="controls">
 			<header>
 				<h1>Topology Coordinates</h1>
-				<p>Drag a joint in the viewport. The grabbed joint is the input; topology coordinates, bone lengths, and contact projection control the rest.</p>
+				<p>Drag a joint in the viewport. The selected limb moves by bounded topology steps; green markers show the kosher targets reachable without violating contact projection.</p>
 			</header>
 
 			<label class="field">
@@ -71,6 +71,10 @@
 				<span>Auto steps <output id="framesOut"></output></span>
 				<input id="frames" type="range" min="32" max="240" value="120" step="1">
 			</label>
+			<label class="range">
+				<span>Kosher preview steps <output id="kosherStepsOut"></output></span>
+				<input id="kosherSteps" type="range" min="3" max="24" value="10" step="1">
+			</label>
 
 			<div class="buttons">
 				<button id="resetBtn" type="button">Reset pose</button>
@@ -78,7 +82,7 @@
 
 			<section class="proof">
 				<h2>Implementation proof</h2>
-				<p class="legend-line"><span class="swatch rejected"></span> rejected crossing vector <span class="swatch projected"></span> projected kosher contact vector</p>
+				<p class="legend-line"><span class="swatch rejected"></span> raw attempted vector <span class="swatch projected"></span> projected kosher vector</p>
 				<div class="proof-grid">
 					<div>
 						<h3>Current writhe matrix</h3>
@@ -93,6 +97,6 @@
 			</section>
 		</aside>
 	</main>
-	<script src="topology-demo.js?v=stable-steps-2"></script>
+	<script src="topology-demo.js?v=constant-limbs-1"></script>
 </body>
 </html>
