@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>GrappleMap IK Only Demo</title>
+	<link rel="stylesheet" href="topology-demo.css">
+	<script src="https://cdn.babylonjs.com/babylon.js"></script>
+	<script src="gm.js"></script>
+</head>
+<body>
+	<main class="app">
+		<section class="viewport">
+			<canvas id="renderCanvas"></canvas>
+			<div class="overlay">
+				<div class="metric"><span>Mode</span><strong id="motionMode">IK only</strong></div>
+				<div class="metric"><span>Drag control</span><strong id="dragStatus">none</strong></div>
+				<div class="metric"><span>Active limb</span><strong id="activeLimb">none</strong></div>
+				<div class="metric"><span>Length error</span><strong id="lengthError">0.000</strong></div>
+			</div>
+		</section>
+
+		<aside class="controls">
+			<header>
+				<h1>IK Only</h1>
+				<p>Drag any joint to move that limb with body-length IK only. The topology solver and contact projection are not loaded.</p>
+			</header>
+
+			<label class="field">
+				<span>GrappleMap position</span>
+				<select id="positionSelect"></select>
+			</label>
+
+			<div class="buttons">
+				<button id="resetBtn" type="button">Reset pose</button>
+			</div>
+
+			<section class="proof">
+				<h2>Loaded systems</h2>
+				<pre id="proofLog"></pre>
+			</section>
+		</aside>
+	</main>
+	<script src="topology-demo/00-shared.js"></script>
+	<script src="topology-demo/01-position-store.js"></script>
+	<script src="topology-demo/02-body-topology-chains.js"></script>
+	<script src="topology-demo/03-ik-body-rules.js"></script>
+	<script src="topology-demo/08-ik-only-motion-input-drivers.js"></script>
+	<script src="topology-demo/09-scene-renderer.js"></script>
+	<script src="topology-demo/10-ik-only-ui-app.js"></script>
+</body>
+</html>

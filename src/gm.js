@@ -82,6 +82,7 @@ var segments =
 	, [[RightHand, RightFingers], 0.08, 0.02, true]
 	, [[RightWrist, RightFingers], 0.14, 0.02, false]
 	, [[LeftHip, RightHip], 0.23, 0.1,  false]
+	, [[LeftShoulder, RightShoulder], 0.32, 0.075, false]
 	, [[LeftShoulder, Neck], 0.175, 0.065, true]
 	, [[RightShoulder, Neck], 0.175, 0.065, true]
 	, [[Neck, Head], 0.165, 0.05, true]
