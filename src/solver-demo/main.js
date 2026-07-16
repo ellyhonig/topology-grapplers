@@ -222,6 +222,7 @@ function setTrackerEngaged(t, engaged) {
 	if (!engaged && t.xrNode) {
 		t.xrNode = null;
 		t.mesh.parent = stageRoot;
+		t.mesh.isPickable = true;
 	}
 	if (t.engaged === engaged) return;
 	t.engaged = engaged;
@@ -349,6 +350,8 @@ function attachTrackerToXrNode(tracker, node, childRotation) {
 	tracker.mesh.parent = node;
 	tracker.mesh.position.copyFromFloats(0, 0, 0);
 	tracker.mesh.rotationQuaternion.copyFrom(childRotation || BABYLON.Quaternion.Identity());
+	// Keep attached tracker meshes from intercepting controller pointer rays.
+	tracker.mesh.isPickable = false;
 	setTrackerEngaged(tracker, true);
 	return true;
 }
