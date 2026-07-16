@@ -47,6 +47,42 @@ In addition, there is:
 
   [![diff](http://eel.is/GrappleMap-extra/diff-small.png)](http://eel.is/GrappleMap-extra/diff-big.png)
 
+## Rust Solver Demo (WebXR)
+
+`src/solver-demo.html` is a browser demo that renders two grapplers with
+[Babylon.js](https://www.babylonjs.com/) and drives their bodies through a Rust
+XPBD constraint solver compiled to WebAssembly (`src/solver-demo/pkg/`, built
+with `wasm-pack`). Each grappler carries five 6-DOF trackers — hands, feet, and
+head, like a VR tracker rig. On desktop you engage a tracker and move it with
+the gizmo; in a headset the trackers follow your controllers or hand tracking,
+and the body follows under gravity, muscle tone, and anatomy limits. Positions
+are loaded from the top-level `GrappleMap.txt`.
+
+**Live build:** https://grapplemap-solver-vr.web.app
+
+### Running it locally
+
+The page is fully client-side but has two path requirements: assets resolve
+relative to `src/`, and the page fetches `../GrappleMap.txt` (the database at the
+repo root). Serve the **repo root** and open the page under `/src/`:
+
+```sh
+python -m http.server 8000      # from the repo root
+# then open http://localhost:8000/src/solver-demo.html
+```
+
+Babylon.js is loaded from a CDN, so an internet connection is needed. The
+`.wasm` module must be served with `Content-Type: application/wasm`.
+
+### VR requires HTTPS
+
+WebXR immersive sessions only run in a [secure
+context](https://developer.mozilla.org/docs/Web/Security/Secure_Contexts):
+`https://` or `localhost`. Loading the page over a plain-HTTP LAN/public IP
+(e.g. `http://192.168.x.x:8080`) lets the desktop 3D scene render but silently
+blocks "Open in VR". Use the HTTPS build above (or any HTTPS host) from the
+headset.
+
 ## FAQ
 
 ### Which grappling techniques are included?
