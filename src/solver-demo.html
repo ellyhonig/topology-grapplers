@@ -7,6 +7,7 @@
 	<link rel="stylesheet" href="topology-demo.css">
 	<link rel="stylesheet" href="solver-demo/solver-demo.css">
 	<script src="https://cdn.babylonjs.com/babylon.js"></script>
+	<script src="https://cdn.babylonjs.com/gui/babylon.gui.min.js"></script>
 	<script src="gm.js"></script>
 </head>
 <body>
@@ -22,14 +23,21 @@
 				<div class="metric"><span>Watchdog</span><strong id="watchdog">clean</strong></div>
 				<div class="metric"><span>Solve time</span><strong id="solveMs">0.0 ms</strong></div>
 				<div class="metric"><span>Trackers</span><strong id="trackerStatus">none engaged</strong></div>
+				<div class="metric"><span>VR</span><strong id="vrStatus">checking...</strong></div>
 			</div>
 		</section>
 
 		<aside class="controls">
 			<header>
 				<h1>Rust XPBD Solver</h1>
-				<p>Each grappler carries five 6-DOF trackers - hands, feet, and head - just like a VR tracker rig. Click a tracker box to engage it, then move and rotate it with the gizmo: the body follows through the Rust constraint solver under gravity, muscle tone, and full anatomy limits. Double-click (or shift-click) a tracker to release it. Joints cannot be grabbed directly.</p>
+				<p>Each grappler carries five 6-DOF trackers - hands, feet, and head. Mouse gizmos still work, or enter VR to drive the red grappler in third person with a headset and two controllers.</p>
 			</header>
+
+			<section class="vr-card">
+				<h2>VR controls</h2>
+				<p>Enter VR, choose a starting position in the floating menu, then press Start. The headset drives the head. Controllers drive the matching hands; hold either trigger to clutch that controller over to its matching foot.</p>
+				<button id="vrStartBtn" type="button" disabled>Start VR controls</button>
+			</section>
 
 			<label class="field">
 				<span>GrappleMap position</span>

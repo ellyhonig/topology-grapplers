@@ -12,11 +12,12 @@
 
 import init, { Engine } from "./pkg/gm_wasm.js";
 
-var engine3d, scene, camera;
+var engine3d, scene, camera, stageRoot;
 var wasmEngine;
 var updatePlayers;
 var currentPose = null; // [[V3;23];2]
 var entries = [];
+var namedEntries = [];
 var jointNames = [];
 var uiTick = 0;
 var dualTest = null; // { t } while the scripted two-player test runs
@@ -39,6 +40,25 @@ var TRACKER_DEFS = [
 var trackers = []; // { player, def, mesh, engaged, auxDist, auxBackDist }
 var gizmoManager = null;
 var selectedTracker = null;
+var headAxisAlignment = null;
+
+// WebXR controls player 0 (the red grappler). All source poses are calibrated
+// against the current tracker pose, so a standing player can control a
+// grappler in any orientation without snapping the body upright.
+var vr = {
+	supported: false,
+	active: false,
+	started: false,
+	menuLocked: false,
+	experience: null,
+	menu: null,
+	headCalibration: null,
+	controllers: {
+		left: { source: null, mode: "hand", calibration: null },
+		right: { source: null, mode: "hand", calibration: null }
+	},
+	lastStatus: ""
+};
 
 function byId(id) { return document.getElementById(id); }
 
@@ -63,6 +83,11 @@ function initScene() {
 	camera.wheelPrecision = 55;
 	var light = new BABYLON.HemisphericLight("hemi", v3(0.4, 1, 0.2), scene);
 	light.intensity = 0.9;
+	stageRoot = new BABYLON.TransformNode("grappler-stage", scene);
+	stageRoot.rotationQuaternion = BABYLON.Quaternion.Identity();
+	// HMD local +Y (head-up) maps to the head gizmo's local +Z
+	// (neck-to-head). This makes an HMD roll bend the avatar's neck.
+	headAxisAlignment = BABYLON.Quaternion.RotationAxis(BABYLON.Axis.X, Math.PI / 2);
 
 	var red = new BABYLON.StandardMaterial("redskin", scene);
 	var blue = new BABYLON.StandardMaterial("blueskin", scene);
@@ -71,16 +96,24 @@ function initScene() {
 	red.specularPower = 0;
 	blue.specularPower = 0;
 
+	var firstPlayerMesh = scene.meshes.length;
 	var updaters = [
 		animated_player_from_array(currentPose[0], red, scene),
 		animated_player_from_array(currentPose[1], blue, scene)
 	];
+	scene.meshes.slice(firstPlayerMesh).forEach(function (mesh) {
+		if (!mesh.parent) mesh.parent = stageRoot;
+	});
 	updatePlayers = function (p) { updaters[0](p[0]); updaters[1](p[1]); };
 
 	var grey = new BABYLON.Color3(0.68, 0.7, 0.72);
 	for (var i = -6; i <= 6; ++i) {
-		BABYLON.MeshBuilder.CreateLines("grid-x", { points: [v3(i / 2, 0, -3), v3(i / 2, 0, 3)] }, scene).color = grey;
-		BABYLON.MeshBuilder.CreateLines("grid-z", { points: [v3(-3, 0, i / 2), v3(3, 0, i / 2)] }, scene).color = grey;
+		var gridX = BABYLON.MeshBuilder.CreateLines("grid-x", { points: [v3(i / 2, 0, -3), v3(i / 2, 0, 3)] }, scene);
+		var gridZ = BABYLON.MeshBuilder.CreateLines("grid-z", { points: [v3(-3, 0, i / 2), v3(3, 0, i / 2)] }, scene);
+		gridX.color = grey;
+		gridZ.color = grey;
+		gridX.parent = stageRoot;
+		gridZ.parent = stageRoot;
 	}
 
 	createTrackers();
@@ -91,6 +124,7 @@ function initScene() {
 		var now = performance.now();
 		var dt = Math.min((now - lastTime) / 1000, 0.05);
 		lastTime = now;
+		updateVrInput();
 		stepSolver(dt);
 		scene.render();
 	});
@@ -115,6 +149,7 @@ function createTrackers() {
 	for (var player = 0; player < 2; ++player) {
 		TRACKER_DEFS.forEach(function (def) {
 			var mesh = BABYLON.MeshBuilder.CreateBox("tracker", { width: 0.07, height: 0.045, depth: 0.11 }, scene);
+			mesh.parent = stageRoot;
 			mesh.rotationQuaternion = BABYLON.Quaternion.Identity();
 			mesh.isPickable = true;
 			// A small nose marks the tracker's forward (+z) axis.
@@ -157,7 +192,20 @@ function syncDisengagedTrackers() {
 		if (auxBack) t.auxBackDist = Math.max(joint.subtract(auxBack).length(), 0.03);
 		if (fwd.length() > 1e-6) {
 			var dir = fwd.normalize();
-			var up = Math.abs(dir.y) > 0.95 ? v3(1, 0, 0) : v3(0, 1, 0);
+			var up;
+			if (t.def.label === "head") {
+				// Anchor local +X to the grappler's anatomical right. HMD local
+				// +X then stays left/right-correct even when the torso is lying
+				// sideways or upside down relative to the room.
+				var shoulderRight = currentPose[t.player][RightShoulder]
+					.subtract(currentPose[t.player][LeftShoulder]);
+				shoulderRight = shoulderRight.subtract(dir.scale(BABYLON.Vector3.Dot(shoulderRight, dir)));
+				if (shoulderRight.lengthSquared() > 1e-6) {
+					shoulderRight.normalize();
+					up = BABYLON.Vector3.Cross(dir, shoulderRight).normalize();
+				}
+			}
+			if (!up) up = Math.abs(dir.y) > 0.95 ? v3(1, 0, 0) : v3(0, 1, 0);
 			var m = BABYLON.Matrix.Zero();
 			BABYLON.Matrix.LookAtLHToRef(v3(0, 0, 0), dir, up, m);
 			m.invert();
@@ -179,6 +227,23 @@ function releaseAllTrackers() {
 	if (gizmoManager) gizmoManager.attachToMesh(null);
 	selectedTracker = null;
 	syncDisengagedTrackers();
+}
+
+function releasePlayerTrackers(player) {
+	trackers.forEach(function (t) {
+		if (t.player === player) setTrackerEngaged(t, false);
+	});
+	if (selectedTracker && selectedTracker.player === player) {
+		gizmoManager.attachToMesh(null);
+		selectedTracker = null;
+	}
+	syncDisengagedTrackers();
+}
+
+function trackerFor(player, label) {
+	return trackers.find(function (t) {
+		return t.player === player && t.def.label === label;
+	});
 }
 
 function refreshTrackerStatus() {
@@ -235,6 +300,437 @@ function installTrackerControls() {
 	hookGizmo(gizmoManager.gizmos.rotationGizmo);
 }
 
+// ---------------------------------------------------------------- WebXR
+
+function copyPose(pose) {
+	return {
+		position: pose.position.clone(),
+		rotation: pose.rotation.clone()
+	};
+}
+
+function nodeWorldPose(node) {
+	if (!node) return null;
+	node.computeWorldMatrix(true);
+	var scale = BABYLON.Vector3.One();
+	var rotation = BABYLON.Quaternion.Identity();
+	var position = BABYLON.Vector3.Zero();
+	if (!node.getWorldMatrix().decompose(scale, rotation, position)) return null;
+	rotation.normalize();
+	return { position: position, rotation: rotation };
+}
+
+function nodePoseInStage(node) {
+	var worldPose = nodeWorldPose(node);
+	if (!worldPose || !stageRoot) return null;
+	stageRoot.computeWorldMatrix(true);
+	var stageScale = BABYLON.Vector3.One();
+	var stageRotation = BABYLON.Quaternion.Identity();
+	var stagePosition = BABYLON.Vector3.Zero();
+	stageRoot.getWorldMatrix().decompose(stageScale, stageRotation, stagePosition);
+	var inverseStage = stageRoot.getWorldMatrix().clone();
+	inverseStage.invert();
+	var localPosition = BABYLON.Vector3.TransformCoordinates(worldPose.position, inverseStage);
+	var localRotation = BABYLON.Quaternion.Inverse(stageRotation).multiply(worldPose.rotation);
+	localRotation.normalize();
+	return { position: localPosition, rotation: localRotation };
+}
+
+function rotateVector(vector, rotation) {
+	var result = BABYLON.Vector3.Zero();
+	vector.rotateByQuaternionToRef(rotation, result);
+	return result;
+}
+
+function remapRelativeRotation(relative, axisAlignment) {
+	var alignment = axisAlignment || BABYLON.Quaternion.Identity();
+	return alignment.multiply(relative).multiply(BABYLON.Quaternion.Inverse(alignment));
+}
+
+function createCalibration(sourcePose, tracker, axisAlignment) {
+	return {
+		source: copyPose(sourcePose),
+		target: {
+			position: tracker.mesh.position.clone(),
+			rotation: tracker.mesh.rotationQuaternion.clone()
+		},
+		axisAlignment: (axisAlignment || BABYLON.Quaternion.Identity()).clone()
+	};
+}
+
+// Map motion in the source's calibration frame into the target tracker's
+// anatomical frame. Translation and rotation both remain relative, which is
+// the key to controlling a lying character from a standing play space.
+function mapCalibratedPose(sourcePose, calibration) {
+	var inverseSource = BABYLON.Quaternion.Inverse(calibration.source.rotation);
+	var sourceDelta = sourcePose.position.subtract(calibration.source.position);
+	var sourceLocalDelta = rotateVector(sourceDelta, inverseSource);
+	var alignedDelta = rotateVector(sourceLocalDelta, calibration.axisAlignment);
+	var targetDelta = rotateVector(alignedDelta, calibration.target.rotation);
+
+	var sourceRelativeRotation = inverseSource.multiply(sourcePose.rotation);
+	var targetRelativeRotation = remapRelativeRotation(sourceRelativeRotation, calibration.axisAlignment);
+	var targetRotation = calibration.target.rotation.multiply(targetRelativeRotation);
+	targetRotation.normalize();
+
+	return {
+		position: calibration.target.position.add(targetDelta),
+		rotation: targetRotation
+	};
+}
+
+function applyVrPose(tracker, sourcePose, calibration) {
+	if (!tracker || !sourcePose || !calibration) return;
+	var mapped = mapCalibratedPose(sourcePose, calibration);
+	tracker.mesh.position.copyFrom(mapped.position);
+	tracker.mesh.rotationQuaternion.copyFrom(mapped.rotation);
+	setTrackerEngaged(tracker, true);
+}
+
+function horizontalForward(rotation) {
+	var forward = rotateVector(BABYLON.Axis.Z, rotation);
+	forward.y = 0;
+	if (forward.lengthSquared() < 1e-6) return v3(0, 0, 1);
+	return forward.normalize();
+}
+
+function recenterVrMenu(force) {
+	if (!vr.active || !vr.menu || vr.menuLocked) return;
+	var cameraPose = nodeWorldPose(vr.experience.baseExperience.camera);
+	if (!cameraPose) return;
+	var forward = horizontalForward(cameraPose.rotation);
+	var toMenu = vr.menu.plane.position.subtract(cameraPose.position);
+	toMenu.y = 0;
+	var outsideFollowCone = toMenu.lengthSquared() < 1e-6 ||
+		BABYLON.Vector3.Dot(forward, toMenu.normalize()) < Math.cos(Math.PI / 6);
+	if (!force && !outsideFollowCone) return;
+	vr.menu.plane.position.copyFrom(cameraPose.position.add(forward.scale(1.15)));
+	vr.menu.plane.position.y = cameraPose.position.y - 0.12;
+	vr.menu.plane.lookAt(cameraPose.position, 0, 0, 0, BABYLON.Space.WORLD);
+}
+
+function placeStageInFront() {
+	var xrCamera = vr.experience.baseExperience.camera;
+	var cameraPose = nodeWorldPose(xrCamera);
+	if (!cameraPose) return false;
+	var forward = horizontalForward(cameraPose.rotation);
+	var yaw = Math.atan2(forward.x, forward.z);
+	var eyeHeight = xrCamera.realWorldHeight;
+	if (!Number.isFinite(eyeHeight) || eyeHeight < 0.8) eyeHeight = 1.65;
+	stageRoot.position.copyFrom(cameraPose.position.add(forward.scale(2.4)));
+	stageRoot.position.y = cameraPose.position.y - eyeHeight;
+	stageRoot.rotationQuaternion.copyFrom(BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Y, yaw));
+	stageRoot.computeWorldMatrix(true);
+	return true;
+}
+
+function controllerNode(source) {
+	return source ? (source.grip || source.pointer || null) : null;
+}
+
+function triggerPressed(source) {
+	if (!source) return false;
+	var motionController = source.motionController;
+	if (motionController) {
+		var component = motionController.getComponent("xr-standard-trigger");
+		if (component) return !!component.pressed || component.value >= 0.55;
+	}
+	var gamepad = source.inputSource && source.inputSource.gamepad;
+	return !!(gamepad && gamepad.buttons && gamepad.buttons[0] &&
+		(gamepad.buttons[0].pressed || gamepad.buttons[0].value >= 0.55));
+}
+
+function trackerForControllerMode(side, mode) {
+	return trackerFor(0, side + (mode === "foot" ? " foot" : " hand"));
+}
+
+function calibrateController(side, mode) {
+	var state = vr.controllers[side];
+	var sourcePose = nodePoseInStage(controllerNode(state.source));
+	if (!sourcePose) {
+		state.calibration = null;
+		return;
+	}
+	var previousTracker = trackerForControllerMode(side, state.mode);
+	var targetTracker = trackerForControllerMode(side, mode);
+	if (previousTracker !== targetTracker) setTrackerEngaged(previousTracker, false);
+	syncDisengagedTrackers();
+	state.mode = mode;
+	state.calibration = createCalibration(sourcePose, targetTracker, BABYLON.Quaternion.Identity());
+	setTrackerEngaged(targetTracker, true);
+}
+
+function updateController(side) {
+	var state = vr.controllers[side];
+	if (!state.source) return;
+	var desiredMode = triggerPressed(state.source) ? "foot" : "hand";
+	if (!state.calibration || desiredMode !== state.mode) calibrateController(side, desiredMode);
+	var sourcePose = nodePoseInStage(controllerNode(state.source));
+	applyVrPose(trackerForControllerMode(side, state.mode), sourcePose, state.calibration);
+}
+
+function calibrateVrTracking(moveStage) {
+	if (!vr.active || !vr.experience) return false;
+	if (moveStage && !placeStageInFront()) return false;
+	releasePlayerTrackers(0);
+	var headTracker = trackerFor(0, "head");
+	var headPose = nodePoseInStage(vr.experience.baseExperience.camera);
+	if (!headPose) return false;
+	vr.headCalibration = createCalibration(headPose, headTracker, headAxisAlignment);
+	setTrackerEngaged(headTracker, true);
+	["left", "right"].forEach(function (side) {
+		var state = vr.controllers[side];
+		state.calibration = null;
+		state.mode = triggerPressed(state.source) ? "foot" : "hand";
+		if (state.source) calibrateController(side, state.mode);
+	});
+	return true;
+}
+
+function startVrTracking() {
+	if (!vr.active) return;
+	if (!calibrateVrTracking(true)) {
+		setVrStatus("Move the headset, then try Start again", "unavailable");
+		return;
+	}
+	vr.started = true;
+	vr.menuLocked = true;
+	byId("positionSelect").disabled = true;
+	refreshVrStatus();
+}
+
+function stopVrTracking() {
+	vr.started = false;
+	vr.menuLocked = false;
+	vr.headCalibration = null;
+	["left", "right"].forEach(function (side) {
+		vr.controllers[side].calibration = null;
+		vr.controllers[side].mode = "hand";
+	});
+	byId("positionSelect").disabled = false;
+	releasePlayerTrackers(0);
+}
+
+function restoreDesktopStage() {
+	stageRoot.position.copyFromFloats(0, 0, 0);
+	stageRoot.rotationQuaternion.copyFrom(BABYLON.Quaternion.Identity());
+	stageRoot.computeWorldMatrix(true);
+}
+
+function updateVrInput() {
+	if (!vr.active || !vr.experience) return;
+	if (!vr.started) {
+		recenterVrMenu(false);
+		return;
+	}
+	var headPose = nodePoseInStage(vr.experience.baseExperience.camera);
+	applyVrPose(trackerFor(0, "head"), headPose, vr.headCalibration);
+	updateController("left");
+	updateController("right");
+	refreshVrStatus();
+}
+
+function setVrStatus(text, className) {
+	var status = byId("vrStatus");
+	status.textContent = text;
+	status.className = className || "";
+	if (vr.menu && vr.menu.status) vr.menu.status.text = text;
+}
+
+function refreshVrPositionLabel() {
+	if (!vr.menu || !vr.menu.position) return;
+	var select = byId("positionSelect");
+	var option = select.options[select.selectedIndex];
+	vr.menu.position.text = option ? option.textContent : "No position";
+}
+
+function refreshVrStatus() {
+	var text;
+	var className;
+	if (!vr.supported) {
+		text = "unavailable";
+		className = "unavailable";
+	} else if (!vr.active) {
+		text = "ready - enter VR";
+		className = "ready";
+	} else if (!vr.started) {
+		text = "choose a position, then Start";
+		className = "ready";
+	} else {
+		var left = vr.controllers.left.source ? vr.controllers.left.mode : "waiting";
+		var right = vr.controllers.right.source ? vr.controllers.right.mode : "waiting";
+		text = "active - head, L " + left + ", R " + right;
+		className = "active";
+	}
+	if (text !== vr.lastStatus) {
+		vr.lastStatus = text;
+		setVrStatus(text, className);
+	}
+	if (vr.menu) {
+		vr.menu.start.isEnabled = vr.active && !vr.started;
+		vr.menu.previous.isEnabled = vr.active && !vr.started;
+		vr.menu.next.isEnabled = vr.active && !vr.started;
+		vr.menu.start.alpha = vr.started ? 0.45 : 1;
+		vr.menu.previous.alpha = vr.started ? 0.45 : 1;
+		vr.menu.next.alpha = vr.started ? 0.45 : 1;
+	}
+	var startButton = byId("vrStartBtn");
+	startButton.disabled = !vr.active || vr.started;
+	startButton.textContent = vr.started ? "VR controls active" : "Start VR controls";
+	refreshVrPositionLabel();
+}
+
+function cyclePosition(direction) {
+	if (vr.started || namedEntries.length === 0) return;
+	var select = byId("positionSelect");
+	var currentIndex = namedEntries.findIndex(function (entry) {
+		return String(entry.index) === select.value;
+	});
+	var nextIndex = (currentIndex + direction + namedEntries.length) % namedEntries.length;
+	select.value = namedEntries[nextIndex].index;
+	loadEntry(namedEntries[nextIndex].index);
+	refreshVrPositionLabel();
+}
+
+function createVrMenu() {
+	if (!BABYLON.GUI) return;
+	var plane = BABYLON.MeshBuilder.CreatePlane("vr-setup-menu", {
+		width: 0.9,
+		height: 0.58,
+		sideOrientation: BABYLON.Mesh.DOUBLESIDE
+	}, scene);
+	plane.isPickable = true;
+	plane.setEnabled(false);
+	var texture = BABYLON.GUI.AdvancedDynamicTexture.CreateForMesh(plane, 1024, 660, false);
+	var background = new BABYLON.GUI.Rectangle("vr-menu-background");
+	background.background = "#101720";
+	background.color = "#91a5bb";
+	background.thickness = 4;
+	background.cornerRadius = 28;
+	texture.addControl(background);
+	var panel = new BABYLON.GUI.StackPanel("vr-menu-panel");
+	panel.width = "900px";
+	panel.paddingTop = "34px";
+	panel.paddingBottom = "26px";
+	background.addControl(panel);
+
+	function addText(name, text, height, size, color) {
+		var control = new BABYLON.GUI.TextBlock(name, text);
+		control.height = height + "px";
+		control.fontSize = size;
+		control.color = color || "white";
+		control.textWrapping = true;
+		panel.addControl(control);
+		return control;
+	}
+	function makeButton(name, text) {
+		var button = BABYLON.GUI.Button.CreateSimpleButton(name, text);
+		button.height = "82px";
+		button.color = "white";
+		button.background = "#245f9e";
+		button.thickness = 2;
+		button.cornerRadius = 15;
+		button.fontSize = 28;
+		return button;
+	}
+
+	addText("vr-menu-title", "GrappleMap VR", 72, 42, "#ffffff");
+	var status = addText("vr-menu-status", "Choose a position, then Start", 72, 24, "#b9cce0");
+	var position = addText("vr-menu-position", "Position", 76, 30, "#ffffff");
+	var row = new BABYLON.GUI.Grid("vr-menu-position-buttons");
+	row.height = "92px";
+	row.addColumnDefinition(0.5);
+	row.addColumnDefinition(0.5);
+	panel.addControl(row);
+	var previous = makeButton("vr-menu-previous", "Previous");
+	var next = makeButton("vr-menu-next", "Next");
+	previous.paddingRight = "8px";
+	next.paddingLeft = "8px";
+	row.addControl(previous, 0, 0);
+	row.addControl(next, 0, 1);
+	var start = makeButton("vr-menu-start", "Start");
+	start.height = "94px";
+	start.background = "#18864b";
+	start.paddingTop = "12px";
+	panel.addControl(start);
+	previous.onPointerUpObservable.add(function () { cyclePosition(-1); });
+	next.onPointerUpObservable.add(function () { cyclePosition(1); });
+	start.onPointerUpObservable.add(startVrTracking);
+	vr.menu = {
+		plane: plane,
+		texture: texture,
+		status: status,
+		position: position,
+		previous: previous,
+		next: next,
+		start: start
+	};
+	refreshVrPositionLabel();
+}
+
+function registerVrController(source) {
+	var side = source.inputSource && source.inputSource.handedness;
+	if (side !== "left" && side !== "right") return;
+	vr.controllers[side].source = source;
+	vr.controllers[side].calibration = null;
+	if (vr.started) calibrateController(side, triggerPressed(source) ? "foot" : "hand");
+	refreshVrStatus();
+}
+
+function unregisterVrController(source) {
+	["left", "right"].forEach(function (side) {
+		var state = vr.controllers[side];
+		if (state.source !== source) return;
+		setTrackerEngaged(trackerForControllerMode(side, "hand"), false);
+		setTrackerEngaged(trackerForControllerMode(side, "foot"), false);
+		state.source = null;
+		state.calibration = null;
+		state.mode = "hand";
+	});
+	refreshVrStatus();
+}
+
+async function initXR() {
+	setVrStatus("checking...", "");
+	if (!navigator.xr || !navigator.xr.isSessionSupported) {
+		setVrStatus("unavailable in this browser", "unavailable");
+		return;
+	}
+	try {
+		vr.supported = await navigator.xr.isSessionSupported("immersive-vr");
+		if (!vr.supported) {
+			setVrStatus("no headset found", "unavailable");
+			return;
+		}
+		vr.experience = await scene.createDefaultXRExperienceAsync({
+			disableTeleportation: true,
+			uiOptions: { sessionMode: "immersive-vr", referenceSpaceType: "local-floor" }
+		});
+		createVrMenu();
+		vr.experience.input.onControllerAddedObservable.add(registerVrController);
+		vr.experience.input.onControllerRemovedObservable.add(unregisterVrController);
+		vr.experience.baseExperience.onStateChangedObservable.add(function (state) {
+			if (state === BABYLON.WebXRState.IN_XR) {
+				vr.active = true;
+				vr.menuLocked = false;
+				vr.menu.plane.setEnabled(true);
+				recenterVrMenu(true);
+			} else if (state === BABYLON.WebXRState.NOT_IN_XR) {
+				stopVrTracking();
+				vr.active = false;
+				vr.menu.plane.setEnabled(false);
+				restoreDesktopStage();
+			}
+			refreshVrStatus();
+		});
+		refreshVrStatus();
+	} catch (error) {
+		console.error("WebXR setup failed", error);
+		vr.supported = false;
+		setVrStatus("VR setup failed", "unavailable");
+	}
+}
+
 // ---------------------------------------------------------------- solve loop
 
 function trackerEffectors(stiffness) {
@@ -249,7 +745,9 @@ function trackerEffectors(stiffness) {
 		// Orientation: forward axis places the optional aux joint (fingers/toe),
 		// and the opposite side places the back joint (wrist/heel/neck), so
 		// tracker rotation turns its associated body part.
-		var fwd = t.mesh.forward ? t.mesh.forward : t.mesh.getDirection(BABYLON.Axis.Z);
+		// Tracker transforms are local to the movable VR stage. Use the local
+		// rotation here so a stage yaw never leaks into solver coordinates.
+		var fwd = rotateVector(BABYLON.Axis.Z, t.mesh.rotationQuaternion);
 		if (t.def.aux !== undefined) {
 			var aux = pos.add(fwd.scale(t.auxDist));
 			list.push([t.player, t.def.aux, aux.x, Math.max(aux.y, 0.02), aux.z, stiffness * 0.7]);
@@ -358,14 +856,17 @@ function refreshHud(solveMs) {
 
 function populatePositions() {
 	var select = byId("positionSelect");
-	entries.forEach(function (e) {
-		if (e.frames !== 1) return; // named positions only
+	namedEntries = entries.filter(function (e) { return e.frames === 1; });
+	namedEntries.forEach(function (e) {
 		var option = document.createElement("option");
 		option.value = e.index;
 		option.textContent = e.name;
 		select.appendChild(option);
 	});
-	select.addEventListener("change", function () { loadEntry(parseInt(select.value, 10)); });
+	select.addEventListener("change", function () {
+		loadEntry(parseInt(select.value, 10));
+		refreshVrPositionLabel();
+	});
 }
 
 function loadEntry(index) {
@@ -373,6 +874,8 @@ function loadEntry(index) {
 	currentPose = flatToPose(wasmEngine.pose());
 	updatePlayers(currentPose);
 	releaseAllTrackers();
+	if (vr.started) calibrateVrTracking(false);
+	refreshVrPositionLabel();
 }
 
 async function boot() {
@@ -402,11 +905,13 @@ async function boot() {
 		if (dualTest) stopDualTest();
 		else startDualTest();
 	});
+	byId("vrStartBtn").addEventListener("click", startVrTracking);
 	var stiffness = byId("stiffness");
 	var stiffnessOut = byId("stiffnessOut");
 	function syncStiffness() { stiffnessOut.textContent = stiffness.value; }
 	stiffness.addEventListener("input", syncStiffness);
 	syncStiffness();
+	await initXR();
 }
 
 // Debug/testing hook: lets automation and the console inspect and drive the
@@ -432,6 +937,31 @@ window.gmDebug = {
 		scriptedEffectors.set("debug", { player: player, joint: joint, target: v3(x, y, z) });
 	},
 	clearDrag: function () { scriptedEffectors.delete("debug"); },
+	vrState: function () {
+		return {
+			supported: vr.supported,
+			active: vr.active,
+			started: vr.started,
+			menuLocked: vr.menuLocked,
+			leftMode: vr.controllers.left.mode,
+			rightMode: vr.controllers.right.mode
+		};
+	},
+	// Pure mapping probe used by automated desktop tests: an HMD roll must
+	// change the neck-to-head direction rather than spinning invisibly.
+	headTiltProbe: function (degrees) {
+		var tracker = trackerFor(0, "head");
+		var before = rotateVector(BABYLON.Axis.Z, tracker.mesh.rotationQuaternion);
+		var relative = BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z, degrees * Math.PI / 180);
+		var mapped = remapRelativeRotation(relative, headAxisAlignment);
+		var afterRotation = tracker.mesh.rotationQuaternion.multiply(mapped);
+		var after = rotateVector(BABYLON.Axis.Z, afterRotation);
+		return {
+			before: { x: before.x, y: before.y, z: before.z },
+			after: { x: after.x, y: after.y, z: after.z },
+			change: BABYLON.Vector3.Distance(before, after)
+		};
+	},
 	// Drive n solver steps synchronously (headless testing without rAF).
 	tick: function (dt, n) {
 		for (var i = 0; i < (n || 1); ++i) stepSolver(dt);

@@ -17,3 +17,29 @@
 #validState.bad {
 	color: #b42318;
 }
+
+.vr-card {
+	margin: 14px 0 18px;
+	padding: 12px;
+	border: 1px solid #b9c8dc;
+	border-radius: 7px;
+	background: #f3f7fc;
+}
+
+.vr-card h2 {
+	margin: 0 0 6px;
+}
+
+.vr-card p {
+	margin: 0 0 10px;
+	font-size: 13px;
+}
+
+#vrStatus.ready,
+#vrStatus.active {
+	color: #1a7f37;
+}
+
+#vrStatus.unavailable {
+	color: #6e7781;
+}
