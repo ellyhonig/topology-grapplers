@@ -37,7 +37,7 @@ var TRACKER_DEFS = [
 	{ label: "head", joint: Head, auxBack: Neck }
 ];
 
-var trackers = []; // { player, def, mesh, engaged, xrNode, auxDist, auxBackDist }
+var trackers = []; // { player, def, mesh, engaged, xrNode, xrAttachment, auxDist, auxBackDist }
 var gizmoManager = null;
 var selectedTracker = null;
 var headChildRotation = null;
@@ -52,13 +52,15 @@ var vr = {
 	trackingPaused: false,
 	stagePlaced: false,
 	menuLocked: false,
+	waitForTriggerRelease: false,
 	player: 0,
 	stageDistance: 1.6,
+	floorOffset: 0,
 	experience: null,
 	menu: null,
 	controllers: {
-		left: { source: null, mode: "hand", attachedTracker: null },
-		right: { source: null, mode: "hand", attachedTracker: null }
+		left: { source: null, mode: "hand", attachedTracker: null, triggerWasPressed: false, triggerCapturedByUi: false, buttonStates: null },
+		right: { source: null, mode: "hand", attachedTracker: null, triggerWasPressed: false, triggerCapturedByUi: false, buttonStates: null }
 	},
 	lastStatus: ""
 };
@@ -167,6 +169,7 @@ function createTrackers() {
 				nose: nose,
 				engaged: false,
 				xrNode: null,
+				xrAttachment: null,
 				auxDist: 0.08,
 				auxBackDist: 0.08
 			};
@@ -221,14 +224,24 @@ function syncDisengagedTrackers() {
 function setTrackerEngaged(t, engaged) {
 	if (!engaged && t.xrNode) {
 		t.xrNode = null;
+		t.xrAttachment = null;
 		t.mesh.parent = stageRoot;
 		t.mesh.isPickable = true;
 	}
+	if (!engaged) t.xrAttachment = null;
 	if (t.engaged === engaged) return;
 	t.engaged = engaged;
 	t.mesh.material = trackerMaterial(t.player, engaged);
 	t.nose.material = t.mesh.material;
 	refreshTrackerStatus();
+}
+
+function setVrTrackerVisualsVisible(player, visible) {
+	trackers.forEach(function (tracker) {
+		if (tracker.player !== player) return;
+		tracker.mesh.visibility = visible ? 1 : 0;
+		tracker.mesh.isPickable = visible && !tracker.xrNode;
+	});
 }
 
 function releaseAllTrackers() {
@@ -274,6 +287,8 @@ function installTrackerControls() {
 	// Engage + select on click; the gizmos then handle 6-DOF manipulation.
 	scene.onPointerObservable.add(function (pointerInfo) {
 		if (pointerInfo.type !== BABYLON.PointerEventTypes.POINTERDOWN) return;
+		if (vr.active && vr.menu && pointerInfo.pickInfo &&
+			pointerInfo.pickInfo.pickedMesh === vr.menu.plane) return;
 		var evt = pointerInfo.event;
 		// scene.pointerX/Y are in render-buffer space (offsetX is CSS space,
 		// which diverges once the canvas is scaled), so picks land correctly.
@@ -344,12 +359,66 @@ function rotateVector(vector, rotation) {
 	return result;
 }
 
-function attachTrackerToXrNode(tracker, node, childRotation) {
+function updatePreservedTrackerPose(tracker, parentPose) {
+	var attachment = tracker && tracker.xrAttachment;
+	var node = tracker && tracker.xrNode;
+	if (!attachment || attachment.mode !== "preserve" || !node) return false;
+	parentPose = parentPose || nodeWorldPose(node);
+	if (!parentPose) return false;
+
+	// Controller translation moves the foot one-to-one while the captured
+	// world-space offset stays fixed. Controller rotation changes foot
+	// orientation without orbiting the ankle target around the controller.
+	var worldPosition = parentPose.position.add(attachment.positionOffset);
+	var parentDelta = parentPose.rotation.multiply(
+		BABYLON.Quaternion.Inverse(attachment.initialParentRotation)
+	);
+	parentDelta.normalize();
+	var worldRotation = parentDelta.multiply(attachment.initialTrackerRotation);
+	worldRotation.normalize();
+
+	node.computeWorldMatrix(true);
+	var inverseParent = node.getWorldMatrix().clone();
+	inverseParent.invert();
+	var localPosition = BABYLON.Vector3.TransformCoordinates(worldPosition, inverseParent);
+	var localRotation = BABYLON.Quaternion.Inverse(parentPose.rotation).multiply(worldRotation);
+	localRotation.normalize();
+	tracker.mesh.position.copyFrom(localPosition);
+	tracker.mesh.rotationQuaternion.copyFrom(localRotation);
+	tracker.mesh.computeWorldMatrix(true);
+	return true;
+}
+
+function updatePreservedFootTrackers() {
+	trackers.forEach(function (tracker) {
+		if (tracker.xrAttachment && tracker.xrAttachment.mode === "preserve") {
+			updatePreservedTrackerPose(tracker);
+		}
+	});
+}
+
+function attachTrackerToXrNode(tracker, node, attachmentMode, childRotation) {
 	if (!tracker || !node) return false;
+	if (attachmentMode === "preserve") {
+		var trackerPose = nodeWorldPose(tracker.mesh);
+		var parentPose = nodeWorldPose(node);
+		if (!trackerPose || !parentPose) return false;
+		tracker.xrAttachment = {
+			mode: "preserve",
+			positionOffset: trackerPose.position.subtract(parentPose.position),
+			initialParentRotation: parentPose.rotation.clone(),
+			initialTrackerRotation: trackerPose.rotation.clone()
+		};
+	}
 	tracker.xrNode = node;
 	tracker.mesh.parent = node;
-	tracker.mesh.position.copyFromFloats(0, 0, 0);
-	tracker.mesh.rotationQuaternion.copyFrom(childRotation || BABYLON.Quaternion.Identity());
+	if (attachmentMode === "preserve") {
+		updatePreservedTrackerPose(tracker, parentPose);
+	} else {
+		tracker.xrAttachment = { mode: "snap" };
+		tracker.mesh.position.copyFromFloats(0, 0, 0);
+		tracker.mesh.rotationQuaternion.copyFrom(childRotation || BABYLON.Quaternion.Identity());
+	}
 	// Keep attached tracker meshes from intercepting controller pointer rays.
 	tracker.mesh.isPickable = false;
 	setTrackerEngaged(tracker, true);
@@ -378,6 +447,9 @@ function recenterVrMenu(force) {
 	// Babylon GUI is drawn on the plane's front face. The yaw correction turns
 	// that face toward the HMD instead of showing the mirrored back face.
 	vr.menu.plane.lookAt(cameraPose.position, Math.PI, 0, 0, BABYLON.Space.WORLD);
+	// During setup the characters travel with the menu. The first tracking
+	// trigger locks both transforms in the play space.
+	if (!vr.started) placeStageInFront();
 }
 
 function placeStageInFront() {
@@ -389,11 +461,38 @@ function placeStageInFront() {
 	var eyeHeight = xrCamera.realWorldHeight;
 	if (!Number.isFinite(eyeHeight) || eyeHeight < 0.8) eyeHeight = 1.65;
 	stageRoot.position.copyFrom(cameraPose.position.add(forward.scale(vr.stageDistance)));
-	stageRoot.position.y = cameraPose.position.y - eyeHeight;
+	stageRoot.position.y = cameraPose.position.y - eyeHeight + vr.floorOffset;
 	stageRoot.rotationQuaternion.copyFrom(BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Y, yaw));
 	stageRoot.computeWorldMatrix(true);
 	vr.stagePlaced = true;
 	return true;
+}
+
+function floorOffsetText(value) {
+	var centimeters = Math.round(value * 100);
+	return (centimeters > 0 ? "+" : "") + centimeters + " cm";
+}
+
+function setFloorOffset(value) {
+	var next = Math.max(-0.75, Math.min(0.75, Math.round(Number(value) * 20) / 20));
+	if (!Number.isFinite(next)) return;
+	var delta = next - vr.floorOffset;
+	vr.floorOffset = next;
+	var input = byId("floorOffset");
+	var output = byId("floorOffsetOut");
+	if (input && Number(input.value) !== next) input.value = next;
+	if (output) output.textContent = floorOffsetText(next);
+	if (vr.menu && vr.menu.floorLabel) {
+		vr.menu.floorLabel.text = "Floor height: " + floorOffsetText(next);
+	}
+	if (delta !== 0 && vr.active && vr.stagePlaced) {
+		stageRoot.position.y += delta;
+		stageRoot.computeWorldMatrix(true);
+	}
+}
+
+function nudgeFloor(direction) {
+	setFloorOffset(vr.floorOffset + direction * 0.05);
 }
 
 function setStageDistance(value) {
@@ -431,6 +530,84 @@ function triggerPressed(source) {
 		(gamepad.buttons[0].pressed || gamepad.buttons[0].value >= 0.55));
 }
 
+function triggerButtonIndex(source) {
+	var motionController = source && source.motionController;
+	var component = motionController && motionController.getComponent("xr-standard-trigger");
+	var index = component && component.gamepadIndices && component.gamepadIndices.button;
+	return Number.isInteger(index) ? index : 0;
+}
+
+function pickVrMenu(source) {
+	if (!source || !vr.menu || !vr.menu.plane.isEnabled()) return null;
+	var ray = new BABYLON.Ray(BABYLON.Vector3.Zero(), BABYLON.Axis.Z, 10);
+	if (typeof source.getWorldPointerRayToRef !== "function") return null;
+	source.getWorldPointerRayToRef(ray);
+	ray.length = 10;
+	var pick = scene.pickWithRay(ray, function (mesh) { return mesh === vr.menu.plane; });
+	return pick && pick.hit ? pick : null;
+}
+
+function activatePointedVrControl(side, pick) {
+	if (!pick) return false;
+	var pointerId = side === "left" ? 2101 : 2102;
+	var eventInit = { pointerId: pointerId, button: 0, buttons: 1 };
+	scene.simulatePointerMove(pick, eventInit);
+	scene.simulatePointerDown(pick, eventInit);
+	eventInit.buttons = 0;
+	scene.simulatePointerUp(pick, eventInit);
+	return true;
+}
+
+function resetControllerInputState(state) {
+	state.triggerWasPressed = triggerPressed(state.source);
+	state.triggerCapturedByUi = false;
+	state.buttonStates = null;
+}
+
+function pollControllerInput(side) {
+	var state = vr.controllers[side];
+	var source = state.source;
+	var triggerIsPressed = triggerPressed(source);
+	var triggerDown = triggerIsPressed && !state.triggerWasPressed;
+	state.triggerWasPressed = triggerIsPressed;
+	var menuPick = triggerDown ? pickVrMenu(source) : null;
+	if (triggerDown) state.triggerCapturedByUi = !!menuPick;
+	else if (!triggerIsPressed) state.triggerCapturedByUi = false;
+	var activatedUi = false;
+	var gamepad = source && source.inputSource && source.inputSource.gamepad;
+	if (gamepad && gamepad.buttons) {
+		var nextStates = Array.prototype.map.call(gamepad.buttons, function (button) {
+			return !!button.pressed || button.value >= 0.55;
+		});
+		if (state.buttonStates && state.buttonStates.length === nextStates.length) {
+			var triggerIndex = triggerButtonIndex(source);
+			for (var i = 0; i < nextStates.length; ++i) {
+				if (i === triggerIndex || !nextStates[i] || state.buttonStates[i]) continue;
+				menuPick = menuPick || pickVrMenu(source);
+				if (!activatedUi) activatedUi = activatePointedVrControl(side, menuPick);
+			}
+		}
+		state.buttonStates = nextStates;
+	}
+	return {
+		triggerPressed: triggerIsPressed,
+		triggerDown: triggerDown,
+		triggerOnMenu: triggerDown && !!menuPick,
+		activatedUi: activatedUi
+	};
+}
+
+function pollVrControllerInput() {
+	var result = { anyTriggerPressed: false, startTriggerDown: false };
+	["left", "right"].forEach(function (side) {
+		var input = pollControllerInput(side);
+		result.anyTriggerPressed = result.anyTriggerPressed || input.triggerPressed;
+		result.startTriggerDown = result.startTriggerDown ||
+			(input.triggerDown && !input.triggerOnMenu);
+	});
+	return result;
+}
+
 function controllerTargetSide(side) {
 	// The GrappleMap rig is presented face-to-face in third person, so WebXR
 	// handedness must be mirrored to reach the limb on the user's same side.
@@ -450,7 +627,8 @@ function attachControllerTracker(side, mode) {
 	if (previousTracker && previousTracker !== targetTracker) setTrackerEngaged(previousTracker, false);
 	state.mode = mode;
 	state.attachedTracker = targetTracker;
-	var attached = attachTrackerToXrNode(targetTracker, node, BABYLON.Quaternion.Identity());
+	var attachmentMode = mode === "foot" ? "preserve" : "snap";
+	var attached = attachTrackerToXrNode(targetTracker, node, attachmentMode, BABYLON.Quaternion.Identity());
 	syncDisengagedTrackers();
 	return attached;
 }
@@ -458,7 +636,8 @@ function attachControllerTracker(side, mode) {
 function updateController(side) {
 	var state = vr.controllers[side];
 	if (!state.source) return;
-	var desiredMode = triggerPressed(state.source) ? "foot" : "hand";
+	var desiredMode = vr.waitForTriggerRelease || state.triggerCapturedByUi ? "hand"
+		: triggerPressed(state.source) ? "foot" : "hand";
 	var node = controllerNode(state.source);
 	if (desiredMode !== state.mode || !state.attachedTracker || state.attachedTracker.xrNode !== node) {
 		attachControllerTracker(side, desiredMode);
@@ -470,12 +649,17 @@ function attachVrTracking(moveStage) {
 	if (moveStage && !placeStageInFront()) return false;
 	releasePlayerTrackers(vr.player);
 	var headTracker = trackerFor(vr.player, "head");
-	if (!attachTrackerToXrNode(headTracker, vr.experience.baseExperience.camera, headChildRotation)) return false;
+	if (!attachTrackerToXrNode(
+		headTracker,
+		vr.experience.baseExperience.camera,
+		"snap",
+		headChildRotation
+	)) return false;
 	["left", "right"].forEach(function (side) {
 		var state = vr.controllers[side];
 		state.attachedTracker = null;
-		state.mode = triggerPressed(state.source) ? "foot" : "hand";
-		if (state.source) attachControllerTracker(side, state.mode);
+		state.mode = "hand";
+		if (state.source) attachControllerTracker(side, "hand");
 	});
 	return true;
 }
@@ -490,21 +674,28 @@ function startVrTracking() {
 	}
 	vr.started = true;
 	vr.menuLocked = true;
+	vr.waitForTriggerRelease = triggerPressed(vr.controllers.left.source) ||
+		triggerPressed(vr.controllers.right.source);
+	setVrTrackerVisualsVisible(vr.player, false);
 	byId("positionSelect").disabled = true;
 	refreshVrStatus();
 }
 
 function clearVrAttachments() {
 	["left", "right"].forEach(function (side) {
-		vr.controllers[side].attachedTracker = null;
-		vr.controllers[side].mode = "hand";
+		var state = vr.controllers[side];
+		state.attachedTracker = null;
+		state.mode = "hand";
+		resetControllerInputState(state);
 	});
+	vr.waitForTriggerRelease = false;
 }
 
 function releaseVrTracking() {
 	vr.started = false;
 	vr.trackingPaused = true;
 	vr.menuLocked = false;
+	setVrTrackerVisualsVisible(vr.player, true);
 	clearVrAttachments();
 	byId("positionSelect").disabled = false;
 	releaseAllTrackers();
@@ -516,6 +707,8 @@ function stopVrTracking() {
 	vr.trackingPaused = false;
 	vr.stagePlaced = false;
 	vr.menuLocked = false;
+	setVrTrackerVisualsVisible(0, true);
+	setVrTrackerVisualsVisible(1, true);
 	clearVrAttachments();
 	byId("positionSelect").disabled = false;
 	releasePlayerTrackers(vr.player);
@@ -529,12 +722,17 @@ function restoreDesktopStage() {
 
 function updateVrInput() {
 	if (!vr.active || !vr.experience) return;
-	if (!vr.started) recenterVrMenu(false);
-	if (vr.trackingPaused) return;
-	var headTracker = trackerFor(vr.player, "head");
-	if (!headTracker.xrNode && !attachVrTracking(!vr.stagePlaced)) return;
+	var input = pollVrControllerInput();
+	if (!vr.started) {
+		recenterVrMenu(false);
+		if (input.startTriggerDown) startVrTracking();
+		refreshVrStatus();
+		return;
+	}
+	if (input.anyTriggerPressed === false) vr.waitForTriggerRelease = false;
 	updateController("left");
 	updateController("right");
+	updatePreservedFootTrackers();
 	refreshVrStatus();
 }
 
@@ -559,9 +757,15 @@ function setControlledPlayer(value) {
 	var select = byId("vrPlayerSelect");
 	if (select) select.value = String(next);
 	if (next !== previous) {
+		setVrTrackerVisualsVisible(previous, true);
 		clearVrAttachments();
 		releasePlayerTrackers(previous);
-		if (vr.active && !vr.trackingPaused) attachVrTracking(false);
+		if (vr.active && vr.started && !vr.trackingPaused) {
+			attachVrTracking(false);
+			setVrTrackerVisualsVisible(next, false);
+		} else {
+			setVrTrackerVisualsVisible(next, true);
+		}
 	}
 	refreshVrStatus();
 }
@@ -592,11 +796,11 @@ function refreshVrStatus() {
 		text = "ready - enter VR";
 		className = "ready";
 	} else if (vr.trackingPaused) {
-		text = "trackers released - Start to resume";
+		text = "trackers released - point away and press trigger to resume";
 		className = "ready";
 	} else if (!vr.started) {
-		text = "live preview - controlling " + playerName;
-		className = "active";
+		text = "setup - position yourself, then press trigger";
+		className = "ready";
 	} else {
 		var left = vr.controllers.left.source ? vr.controllers.left.mode : "waiting";
 		var right = vr.controllers.right.source ? vr.controllers.right.mode : "waiting";
@@ -613,20 +817,24 @@ function refreshVrStatus() {
 		vr.menu.previous.isEnabled = vr.active && !vr.started;
 		vr.menu.next.isEnabled = vr.active && !vr.started;
 		vr.menu.start.alpha = vr.started ? 0.45 : 1;
-		vr.menu.start.textBlock.text = vr.started ? "Controls active" : (vr.trackingPaused ? "Resume controls" : "Start");
+		vr.menu.start.textBlock.text = vr.started ? "Controls active" : (vr.trackingPaused ? "Resume controls" : "Start tracking");
 		vr.menu.previous.alpha = positionEnabled ? 1 : 0.45;
 		vr.menu.next.alpha = positionEnabled ? 1 : 0.45;
 		vr.menu.reset.isEnabled = vr.active;
 		vr.menu.release.isEnabled = vr.active && !vr.trackingPaused;
 		vr.menu.reset.alpha = vr.active ? 1 : 0.45;
 		vr.menu.release.alpha = vr.active && !vr.trackingPaused ? 1 : 0.45;
+		vr.menu.floorDown.isEnabled = vr.active;
+		vr.menu.floorUp.isEnabled = vr.active;
+		vr.menu.floorDown.alpha = vr.active ? 1 : 0.45;
+		vr.menu.floorUp.alpha = vr.active ? 1 : 0.45;
 		vr.menu.playerRed.background = vr.player === 0 ? "#a4261b" : "#35475a";
 		vr.menu.playerBlue.background = vr.player === 1 ? "#234eac" : "#35475a";
 	}
 	var startButton = byId("vrStartBtn");
 	startButton.disabled = !vr.active || vr.started;
 	startButton.textContent = vr.started ? "VR controls active"
-		: vr.trackingPaused ? "Resume VR controls" : "Start VR controls";
+		: vr.trackingPaused ? "Resume VR controls" : "Start tracking";
 	byId("positionSelect").disabled = vr.started;
 	refreshVrPositionLabel();
 }
@@ -647,12 +855,12 @@ function createVrMenu() {
 	if (!BABYLON.GUI) return;
 	var plane = BABYLON.MeshBuilder.CreatePlane("vr-setup-menu", {
 		width: 1.05,
-		height: 0.98,
+		height: 1.12,
 		sideOrientation: BABYLON.Mesh.DOUBLESIDE
 	}, scene);
 	plane.isPickable = true;
 	plane.setEnabled(false);
-	var texture = BABYLON.GUI.AdvancedDynamicTexture.CreateForMesh(plane, 1100, 1030, false);
+	var texture = BABYLON.GUI.AdvancedDynamicTexture.CreateForMesh(plane, 1100, 1180, false);
 	var background = new BABYLON.GUI.Rectangle("vr-menu-background");
 	background.background = "#101720";
 	background.color = "#91a5bb";
@@ -713,7 +921,7 @@ function createVrMenu() {
 	}
 
 	addText("vr-menu-title", "GrappleMap VR", 60, 40, "#ffffff");
-	var status = addText("vr-menu-status", "Live preview", 56, 23, "#b9cce0");
+	var status = addText("vr-menu-status", "Position yourself, then press trigger", 56, 23, "#b9cce0");
 	var position = addText("vr-menu-position", "Position", 58, 28, "#ffffff");
 	var previous = makeButton("vr-menu-previous", "Previous");
 	var next = makeButton("vr-menu-next", "Next");
@@ -724,6 +932,10 @@ function createVrMenu() {
 	makeTwoColumnRow("vr-menu-player-buttons", playerRed, playerBlue);
 	var distanceLabel = addText("vr-menu-distance-label", "Scene distance: " + vr.stageDistance.toFixed(1) + " m", 46, 24, "#b9cce0");
 	var distance = makeSlider("vr-menu-distance", 1, 3, vr.stageDistance, 0.1);
+	var floorLabel = addText("vr-menu-floor-label", "Floor height: " + floorOffsetText(vr.floorOffset), 46, 24, "#b9cce0");
+	var floorDown = makeButton("vr-menu-floor-down", "Floor -5 cm");
+	var floorUp = makeButton("vr-menu-floor-up", "Floor +5 cm");
+	makeTwoColumnRow("vr-menu-floor-buttons", floorDown, floorUp);
 	var stiffnessValue = parseFloat(byId("stiffness").value);
 	var stiffnessLabel = addText("vr-menu-stiffness-label", "Tracker stiffness: " + stiffnessValue, 46, 24, "#b9cce0");
 	var stiffness = makeSlider("vr-menu-stiffness", 0.1, 1, stiffnessValue, 0.05);
@@ -740,6 +952,8 @@ function createVrMenu() {
 	playerRed.onPointerUpObservable.add(function () { setControlledPlayer(0); });
 	playerBlue.onPointerUpObservable.add(function () { setControlledPlayer(1); });
 	distance.onValueChangedObservable.add(setStageDistance);
+	floorDown.onPointerUpObservable.add(function () { nudgeFloor(-1); });
+	floorUp.onPointerUpObservable.add(function () { nudgeFloor(1); });
 	stiffness.onValueChangedObservable.add(setTrackerStiffness);
 	reset.onPointerUpObservable.add(resetSelectedPose);
 	release.onPointerUpObservable.add(releaseVrTracking);
@@ -756,6 +970,9 @@ function createVrMenu() {
 		playerBlue: playerBlue,
 		distanceLabel: distanceLabel,
 		distance: distance,
+		floorLabel: floorLabel,
+		floorDown: floorDown,
+		floorUp: floorUp,
 		stiffnessLabel: stiffnessLabel,
 		stiffness: stiffness,
 		reset: reset,
@@ -768,9 +985,11 @@ function createVrMenu() {
 function registerVrController(source) {
 	var side = source.inputSource && source.inputSource.handedness;
 	if (side !== "left" && side !== "right") return;
-	vr.controllers[side].source = source;
-	vr.controllers[side].attachedTracker = null;
-	if (vr.active && !vr.trackingPaused) attachControllerTracker(side, triggerPressed(source) ? "foot" : "hand");
+	var state = vr.controllers[side];
+	state.source = source;
+	state.attachedTracker = null;
+	resetControllerInputState(state);
+	if (vr.active && vr.started && !vr.trackingPaused) attachControllerTracker(side, "hand");
 	refreshVrStatus();
 }
 
@@ -783,6 +1002,7 @@ function unregisterVrController(source) {
 		state.source = null;
 		state.attachedTracker = null;
 		state.mode = "hand";
+		resetControllerInputState(state);
 	});
 	refreshVrStatus();
 }
@@ -814,11 +1034,11 @@ async function initXR() {
 				vr.stagePlaced = false;
 				vr.menuLocked = false;
 				clearVrAttachments();
+				setVrTrackerVisualsVisible(vr.player, true);
 				if (vr.menu) vr.menu.plane.setEnabled(true);
 				recenterVrMenu(true);
-				// Entering VR immediately starts a live pose preview. Start only
-				// locks the chosen position and menu placement.
-				attachVrTracking(true);
+				// Setup remains untracked so the user can align with the staged
+				// grappler. The first trigger press performs the one-time snap.
 			} else if (state === BABYLON.WebXRState.NOT_IN_XR) {
 				stopVrTracking();
 				vr.active = false;
@@ -859,7 +1079,11 @@ function trackerEffectors(stiffness) {
 			var aux = pos.add(fwd.scale(t.auxDist));
 			list.push([t.player, t.def.aux, aux.x, Math.max(aux.y, 0.02), aux.z, stiffness * 0.7]);
 		}
-		if (t.def.auxBack !== undefined) {
+		// For an XR foot, rotation aims only the toe around the pinned ankle.
+		// Targeting the heel as well turns foot rotation into a second lever on
+		// the whole leg, which makes knees and hips swing unnaturally.
+		var xrFoot = t.xrAttachment && / foot$/.test(t.def.label);
+		if (t.def.auxBack !== undefined && !xrFoot) {
 			var auxBack = pos.subtract(fwd.scale(t.auxBackDist));
 			list.push([t.player, t.def.auxBack, auxBack.x, Math.max(auxBack.y, 0.02), auxBack.z, stiffness * 0.5]);
 		}
@@ -981,7 +1205,10 @@ function loadEntry(index) {
 	currentPose = flatToPose(wasmEngine.pose());
 	updatePlayers(currentPose);
 	releaseAllTrackers();
-	if (vr.active && !vr.trackingPaused) attachVrTracking(false);
+	if (vr.active && vr.started && !vr.trackingPaused) {
+		attachVrTracking(false);
+		setVrTrackerVisualsVisible(vr.player, false);
+	}
 	refreshVrPositionLabel();
 }
 
@@ -1024,10 +1251,14 @@ async function boot() {
 	byId("sceneDistance").addEventListener("input", function (event) {
 		setStageDistance(event.target.value);
 	});
+	byId("floorOffset").addEventListener("input", function (event) {
+		setFloorOffset(event.target.value);
+	});
 	var stiffness = byId("stiffness");
 	stiffness.addEventListener("input", function (event) { setTrackerStiffness(event.target.value); });
 	setControlledPlayer(byId("vrPlayerSelect").value);
 	setStageDistance(byId("sceneDistance").value);
+	setFloorOffset(byId("floorOffset").value);
 	setTrackerStiffness(stiffness.value);
 	await initXR();
 }
@@ -1064,6 +1295,8 @@ window.gmDebug = {
 			menuLocked: vr.menuLocked,
 			player: vr.player,
 			stageDistance: vr.stageDistance,
+			floorOffset: vr.floorOffset,
+			waitForTriggerRelease: vr.waitForTriggerRelease,
 			leftTargetSide: controllerTargetSide("left"),
 			rightTargetSide: controllerTargetSide("right"),
 			headParented: !!trackerFor(vr.player, "head").xrNode,

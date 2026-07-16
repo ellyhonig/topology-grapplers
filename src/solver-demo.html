@@ -35,7 +35,7 @@
 
 			<section class="vr-card">
 				<h2>VR controls</h2>
-				<p>Enter VR and the selected grappler immediately follows you while you choose a pose. Start locks the starting position. The head, hand, and foot tracker gizmos attach directly to the headset or controller; holding a trigger moves that controller from its hand to its foot.</p>
+				<p>Enter VR, choose a pose, and position yourself before tracking. The menu and grapplers follow your view during setup. Point away from the menu and press either trigger once to snap on tracking; after releasing it, a trigger hold clutches that controller from the hand to the foot.</p>
 				<label class="field">
 					<span>VR-controlled grappler</span>
 					<select id="vrPlayerSelect">
@@ -47,8 +47,12 @@
 					<span>VR scene distance <output id="sceneDistanceOut">1.6 m</output></span>
 					<input id="sceneDistance" type="range" min="1" max="3" value="1.6" step="0.1">
 				</label>
-				<button id="vrStartBtn" type="button" disabled>Start VR controls</button>
-				<p class="hint">Position, player, distance, stiffness, reset, and tracker-release controls are also available in the floating VR panel.</p>
+				<label class="range">
+					<span>Manual floor height <output id="floorOffsetOut">0 cm</output></span>
+					<input id="floorOffset" type="range" min="-0.75" max="0.75" value="0" step="0.05">
+				</label>
+				<button id="vrStartBtn" type="button" disabled>Start tracking</button>
+				<p class="hint">Position, player, distance, floor height, stiffness, reset, and tracker-release controls are also available in the floating VR panel. Point at a panel control and press any controller button to activate it.</p>
 			</section>
 
 			<label class="field">

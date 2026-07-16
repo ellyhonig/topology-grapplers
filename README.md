@@ -58,9 +58,13 @@ the gizmo; in a headset the trackers follow your controllers or hand tracking,
 with the active gizmo parented directly to its XR transform. The body follows
 under gravity, muscle tone, and anatomy limits. Positions
 are loaded from the top-level `GrappleMap.txt`. In VR, choose whether to drive
-the red or blue grappler; live tracking starts as soon as the immersive session
-opens, before the starting pose is locked. The floating panel includes pose
-reset, tracker release, stiffness, and scene-distance controls.
+the red or blue grappler, position the shared menu/grappler stage, adjust the
+manual floor height if needed, then press either trigger once to start tracking.
+The first press snaps the hands and head to the XR hardware and hides the
+tracker visuals. Foot clutching preserves the foot's offset and orientation and
+uses rotation only around the ankle. The floating panel accepts any controller
+button and includes pose reset, tracker release, stiffness, floor-height, and
+scene-distance controls.
 
 **Live build:** https://grapplemap-solver-vr.web.app
 

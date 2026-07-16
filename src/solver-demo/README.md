@@ -37,26 +37,32 @@ All three requests should return `200`. The WASM response should use
 ## VR controls
 
 1. Open the demo in a WebXR-capable headset browser and choose **Enter VR**.
-2. The selected grappler immediately follows the headset and controllers while
-   the setup menu remains available.
-3. Choose a starting GrappleMap position and either the red or blue grappler.
-4. Adjust scene distance or tracker stiffness if needed, then press **Start**
-   to lock the position choice.
-5. Move the headset to drive the selected grappler's head.
-6. Move the left and right controllers to drive the limbs on the corresponding
-   sides.
-7. Hold a controller trigger to clutch that side from the hand to the foot;
-   release it to return to the hand.
+2. Choose a starting GrappleMap position and either the red or blue grappler.
+   No body trackers are active during setup.
+3. Move and turn your head to position yourself. Whenever the setup panel
+   recenters, the grappler stage recenters with it.
+4. Adjust scene distance, manual floor height, or tracker stiffness if needed.
+   Point at a panel control and press any controller button to activate it.
+5. Point away from the panel and press either trigger once. This locks the
+   setup placement, snaps the head and both hands to the headset/controllers,
+   and hides the controlled grappler's tracker-box visuals.
+6. Release the starting trigger. After that, hold a controller trigger to
+   clutch that side from the hand to the foot; release it to return to the
+   hand.
 
-XR input uses direct transform parenting: the active head, hand, or foot
-tracker gizmo is a zero-offset child of the headset or controller node. The
-solver reads that child's world pose in stage coordinates without an
-intermediate motion-calibration transform.
+At the initial tracking moment, head and hand trackers snap directly onto the
+headset and controllers. A foot clutch instead captures the foot's existing
+position and orientation relative to that controller. Controller translation
+then moves the ankle without controller rotation orbiting it, while rotation
+aims the toe around the pinned ankle and does not pull on the heel/whole leg.
+The solver reads all tracker world poses in stage coordinates.
 
-The floating panel also provides **Reset pose** and **Release trackers**.
-Releasing trackers pauses VR control until **Resume controls** is pressed.
-Before Start, the setup menu recenters when the headset turns more than 30
-degrees away from it. After Start, the menu stays locked in the play space.
+The floating panel also provides **Floor -5 cm**, **Floor +5 cm**, **Reset
+pose**, and **Release trackers**. Releasing trackers returns to setup; the next
+off-panel trigger press resumes tracking with a fresh one-time snap. Before
+tracking starts, the setup menu and grappler stage recenter together when the
+headset turns more than 30 degrees away. After tracking starts, both stay
+locked in the play space.
 
 ## Headset access and port forwarding
 
