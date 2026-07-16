@@ -23,6 +23,11 @@ var uiTick = 0;
 var dualTest = null; // { t } while the scripted two-player test runs
 var scriptedEffectors = new Map(); // debug hook -> { player, joint, target }
 
+// Controller orientation should feel like a wrist adjustment, not a lever
+// capable of swinging the whole arm. Translation remains one-to-one while
+// only this fraction of the controller's rotation reaches the tracker target.
+var XR_CONTROLLER_ROTATION_GAIN = 0.35;
+
 // ---------------------------------------------------------------- trackers
 
 // joint: the joint the tracker position drives.
@@ -41,9 +46,10 @@ var trackers = []; // { player, def, mesh, engaged, xrNode, auxDist, auxBackDist
 var gizmoManager = null;
 var selectedTracker = null;
 
-// WebXR controls one selected grappler by parenting tracker gizmos directly to
-// the headset and controller transform nodes. No pose-delta calibration layer
-// sits between the hardware and the solver targets.
+// WebXR controls one selected grappler by parenting tracker gizmos to the
+// headset and controller transform nodes. The attachment preserves the
+// pre-existing world-position offset without letting controller rotation orbit
+// that offset around the hardware.
 var vr = {
 	supported: false,
 	active: false,
@@ -164,6 +170,7 @@ function createTrackers() {
 				nose: nose,
 				engaged: false,
 				xrNode: null,
+				xrAttachment: null,
 				auxDist: 0.08,
 				auxBackDist: 0.08
 			};
@@ -218,9 +225,11 @@ function syncDisengagedTrackers() {
 function setTrackerEngaged(t, engaged) {
 	if (!engaged && t.xrNode) {
 		t.xrNode = null;
+		t.xrAttachment = null;
 		t.mesh.parent = stageRoot;
 		t.mesh.isPickable = true;
 	}
+	if (!engaged) t.xrAttachment = null;
 	if (t.engaged === engaged) return;
 	t.engaged = engaged;
 	t.mesh.material = trackerMaterial(t.player, engaged);
@@ -341,24 +350,61 @@ function rotateVector(vector, rotation) {
 	return result;
 }
 
-function attachTrackerToXrNode(tracker, node) {
-	if (!tracker || !node) return false;
-	// Capture the gizmo's current world pose before reparenting. The resulting
-	// child transform is the existing tracker-to-controller offset, so movement
-	// follows the controller without snapping the target onto the hardware.
-	var trackerPose = nodeWorldPose(tracker.mesh);
-	var parentPose = nodeWorldPose(node);
-	if (!trackerPose || !parentPose) return false;
+function updateAttachedTrackerPose(tracker, parentPose) {
+	var attachment = tracker && tracker.xrAttachment;
+	var node = tracker && tracker.xrNode;
+	if (!attachment || !node) return false;
+	parentPose = parentPose || nodeWorldPose(node);
+	if (!parentPose) return false;
+
+	// Keep the captured positional offset in world space. If it stayed as an
+	// ordinary child offset, rotating a controller would orbit the hand target
+	// and pull the elbow and shoulder around with it.
+	var worldPosition = parentPose.position.add(attachment.positionOffset);
+	var parentDelta = parentPose.rotation.multiply(
+		BABYLON.Quaternion.Inverse(attachment.initialParentRotation)
+	);
+	parentDelta.normalize();
+	var appliedDelta = attachment.rotationGain < 0.999
+		? BABYLON.Quaternion.Slerp(BABYLON.Quaternion.Identity(), parentDelta, attachment.rotationGain)
+		: parentDelta;
+	var worldRotation = appliedDelta.multiply(attachment.initialTrackerRotation);
+	worldRotation.normalize();
+
 	node.computeWorldMatrix(true);
 	var inverseParent = node.getWorldMatrix().clone();
 	inverseParent.invert();
-	var localPosition = BABYLON.Vector3.TransformCoordinates(trackerPose.position, inverseParent);
-	var localRotation = BABYLON.Quaternion.Inverse(parentPose.rotation).multiply(trackerPose.rotation);
+	var localPosition = BABYLON.Vector3.TransformCoordinates(worldPosition, inverseParent);
+	var localRotation = BABYLON.Quaternion.Inverse(parentPose.rotation).multiply(worldRotation);
 	localRotation.normalize();
-	tracker.xrNode = node;
-	tracker.mesh.parent = node;
 	tracker.mesh.position.copyFrom(localPosition);
 	tracker.mesh.rotationQuaternion.copyFrom(localRotation);
+	tracker.mesh.computeWorldMatrix(true);
+	return true;
+}
+
+function updateAttachedXrTrackers() {
+	trackers.forEach(function (tracker) {
+		if (tracker.xrNode) updateAttachedTrackerPose(tracker);
+	});
+}
+
+function attachTrackerToXrNode(tracker, node) {
+	if (!tracker || !node) return false;
+	// Capture the gizmo's current world pose before reparenting so the target
+	// keeps its existing offset instead of snapping onto the XR hardware.
+	var trackerPose = nodeWorldPose(tracker.mesh);
+	var parentPose = nodeWorldPose(node);
+	if (!trackerPose || !parentPose) return false;
+	tracker.xrNode = node;
+	tracker.xrAttachment = {
+		positionOffset: trackerPose.position.subtract(parentPose.position),
+		initialParentRotation: parentPose.rotation.clone(),
+		initialTrackerRotation: trackerPose.rotation.clone(),
+		rotationGain: tracker.def.label === "head" ? 1 : XR_CONTROLLER_ROTATION_GAIN
+	};
+	tracker.mesh.parent = node;
+	updateAttachedTrackerPose(tracker, parentPose);
 	// An attached tracker can otherwise sit in front of its controller ray and
 	// steal pointer hits from the floating GUI.
 	tracker.mesh.isPickable = false;
@@ -475,10 +521,6 @@ function updateController(side) {
 	}
 }
 
-function eitherTriggerPressed() {
-	return triggerPressed(vr.controllers.left.source) || triggerPressed(vr.controllers.right.source);
-}
-
 function attachHeadTracker() {
 	var headTracker = trackerFor(vr.player, "head");
 	if (headTracker.xrNode) return true;
@@ -487,13 +529,12 @@ function attachHeadTracker() {
 	return true;
 }
 
-function attachVrTracking(moveStage, resetHeadGate) {
+function attachVrTracking(moveStage) {
 	if (!vr.active || !vr.experience) return false;
 	if (moveStage && !placeStageInFront()) return false;
-	var reattachHead = vr.headTrackingStarted && !resetHeadGate;
 	releasePlayerTrackers(vr.player);
-	if (resetHeadGate) vr.headTrackingStarted = false;
-	else if (reattachHead && !attachHeadTracker()) return false;
+	vr.headTrackingStarted = false;
+	if (!attachHeadTracker()) return false;
 	["left", "right"].forEach(function (side) {
 		var state = vr.controllers[side];
 		state.attachedTracker = null;
@@ -506,7 +547,7 @@ function attachVrTracking(moveStage, resetHeadGate) {
 function startVrTracking() {
 	if (!vr.active) return;
 	vr.trackingPaused = false;
-	if (!attachVrTracking(!vr.stagePlaced, false)) {
+	if (!attachVrTracking(!vr.stagePlaced)) {
 		vr.trackingPaused = true;
 		setVrStatus("Move the headset, then try Start again", "unavailable");
 		return;
@@ -555,9 +596,10 @@ function updateVrInput() {
 	if (!vr.active || !vr.experience) return;
 	if (!vr.started) recenterVrMenu(false);
 	if (vr.trackingPaused) return;
-	if (!vr.headTrackingStarted && eitherTriggerPressed()) attachHeadTracker();
+	if (!trackerFor(vr.player, "head").xrNode) attachHeadTracker();
 	updateController("left");
 	updateController("right");
+	updateAttachedXrTrackers();
 	refreshVrStatus();
 }
 
@@ -584,7 +626,7 @@ function setControlledPlayer(value) {
 	if (next !== previous) {
 		clearVrAttachments();
 		releasePlayerTrackers(previous);
-		if (vr.active && !vr.trackingPaused) attachVrTracking(false, true);
+		if (vr.active && !vr.trackingPaused) attachVrTracking(false);
 	}
 	refreshVrStatus();
 }
@@ -618,7 +660,7 @@ function refreshVrStatus() {
 		text = "trackers released - Start to resume";
 		className = "ready";
 	} else if (!vr.started) {
-		text = "live preview - " + playerName + (vr.headTrackingStarted ? ", head active" : ", trigger starts head");
+		text = "live preview - " + playerName + (vr.headTrackingStarted ? ", head active" : ", connecting head");
 		className = "active";
 	} else {
 		var left = vr.controllers.left.source ? vr.controllers.left.mode : "waiting";
@@ -842,7 +884,7 @@ async function initXR() {
 				recenterVrMenu(true);
 				// Entering VR immediately starts a live pose preview. Start only
 				// locks the chosen position and menu placement.
-				attachVrTracking(true, true);
+				attachVrTracking(true);
 			} else if (state === BABYLON.WebXRState.NOT_IN_XR) {
 				stopVrTracking();
 				vr.active = false;
@@ -883,7 +925,12 @@ function trackerEffectors(stiffness) {
 			var aux = pos.add(fwd.scale(t.auxDist));
 			list.push([t.player, t.def.aux, aux.x, Math.max(aux.y, 0.02), aux.z, stiffness * 0.7]);
 		}
-		if (t.def.auxBack !== undefined) {
+		// A controller's rotation only aims the distal hand/foot segment. Directly
+		// targeting the wrist or heel turns orientation into a second positional
+		// lever on the entire arm or leg. The HMD still uses the neck target so
+		// head orientation remains visible.
+		var controllerAttached = t.xrAttachment && t.def.label !== "head";
+		if (t.def.auxBack !== undefined && !controllerAttached) {
 			var auxBack = pos.subtract(fwd.scale(t.auxBackDist));
 			list.push([t.player, t.def.auxBack, auxBack.x, Math.max(auxBack.y, 0.02), auxBack.z, stiffness * 0.5]);
 		}
@@ -1005,7 +1052,7 @@ function loadEntry(index) {
 	currentPose = flatToPose(wasmEngine.pose());
 	updatePlayers(currentPose);
 	releaseAllTrackers();
-	if (vr.active && !vr.trackingPaused) attachVrTracking(false, true);
+	if (vr.active && !vr.trackingPaused) attachVrTracking(false);
 	refreshVrPositionLabel();
 }
 

@@ -42,19 +42,21 @@ All three requests should return `200`. The WASM response should use
 3. Choose a starting GrappleMap position and either the red or blue grappler.
 4. Adjust scene distance or tracker stiffness if needed, then press **Start**
    to lock the position choice.
-5. Press either controller trigger once to start head tracking, then move the
-   headset to drive the selected grappler's head.
+5. Move the headset to drive the selected grappler's head; head tracking stays
+   active whenever VR controls are active.
 6. Move the left and right controllers to drive the limbs on the corresponding
    sides.
 7. Hold a controller trigger to clutch that side from the hand to the foot;
    release it to return to the hand.
 
-XR input uses direct transform parenting: the active head, hand, or foot
-tracker gizmo becomes a child of the headset or controller node while
-preserving its current world pose as the child offset. The solver reads that
-child's world pose in stage coordinates without an intermediate motion-
-calibration transform. XR-attached tracker meshes are excluded from pointer
-picking so the controller rays can continue to operate the floating panel.
+XR input keeps the active head, hand, or foot tracker gizmo parented to the
+headset or controller node while preserving its positional offset in world
+space. Controller rotation therefore cannot orbit the tracker position and
+pull the whole limb. Controller orientation is reduced to 35% and aims only
+the distal hand or foot segment; headset orientation remains one-to-one. The
+solver reads the resulting child world pose in stage coordinates. XR-attached
+tracker meshes are excluded from pointer picking so the controller rays can
+continue to operate the floating panel.
 
 The floating panel also provides **Reset pose** and **Release trackers**.
 Releasing trackers pauses VR control until **Resume controls** is pressed.
