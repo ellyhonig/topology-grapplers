@@ -37,15 +37,14 @@ var TRACKER_DEFS = [
 	{ label: "head", joint: Head, auxBack: Neck }
 ];
 
-var trackers = []; // { player, def, mesh, engaged, auxDist, auxBackDist }
+var trackers = []; // { player, def, mesh, engaged, xrNode, auxDist, auxBackDist }
 var gizmoManager = null;
 var selectedTracker = null;
-var headTranslationAlignment = null;
-var headRotationAlignment = null;
+var headChildRotation = null;
 
-// WebXR controls one selected grappler. All source poses are calibrated against
-// the current tracker pose, so a standing player can control a grappler in any
-// orientation without snapping the body upright.
+// WebXR controls one selected grappler by parenting tracker gizmos directly to
+// the headset and controller transform nodes. No pose-delta calibration layer
+// sits between the hardware and the solver targets.
 var vr = {
 	supported: false,
 	active: false,
@@ -57,10 +56,9 @@ var vr = {
 	stageDistance: 1.6,
 	experience: null,
 	menu: null,
-	headCalibration: null,
 	controllers: {
-		left: { source: null, mode: "hand", calibration: null },
-		right: { source: null, mode: "hand", calibration: null }
+		left: { source: null, mode: "hand", attachedTracker: null },
+		right: { source: null, mode: "hand", attachedTracker: null }
 	},
 	lastStatus: ""
 };
@@ -90,12 +88,9 @@ function initScene() {
 	light.intensity = 0.9;
 	stageRoot = new BABYLON.TransformNode("grappler-stage", scene);
 	stageRoot.rotationQuaternion = BABYLON.Quaternion.Identity();
-	// HMD local +Y (head-up) maps to the head gizmo's local +Z
-	// (neck-to-head). Translation keeps HMD left/right unchanged. Rotation uses
-	// the opposite quarter-turn so HMD roll bends the neck in the same direction
-	// instead of mirroring the user's lean.
-	headTranslationAlignment = BABYLON.Quaternion.RotationAxis(BABYLON.Axis.X, Math.PI / 2);
-	headRotationAlignment = BABYLON.Quaternion.RotationAxis(BABYLON.Axis.X, -Math.PI / 2);
+	// As a direct child of the HMD, rotate the head gizmo so its +Z axis
+	// (neck-to-head) follows the headset's +Y up axis.
+	headChildRotation = BABYLON.Quaternion.RotationAxis(BABYLON.Axis.X, -Math.PI / 2);
 
 	var red = new BABYLON.StandardMaterial("redskin", scene);
 	var blue = new BABYLON.StandardMaterial("blueskin", scene);
@@ -171,6 +166,7 @@ function createTrackers() {
 				mesh: mesh,
 				nose: nose,
 				engaged: false,
+				xrNode: null,
 				auxDist: 0.08,
 				auxBackDist: 0.08
 			};
@@ -223,6 +219,10 @@ function syncDisengagedTrackers() {
 }
 
 function setTrackerEngaged(t, engaged) {
+	if (!engaged && t.xrNode) {
+		t.xrNode = null;
+		t.mesh.parent = stageRoot;
+	}
 	if (t.engaged === engaged) return;
 	t.engaged = engaged;
 	t.mesh.material = trackerMaterial(t.player, engaged);
@@ -310,13 +310,6 @@ function installTrackerControls() {
 
 // ---------------------------------------------------------------- WebXR
 
-function copyPose(pose) {
-	return {
-		position: pose.position.clone(),
-		rotation: pose.rotation.clone()
-	};
-}
-
 function nodeWorldPose(node) {
 	if (!node) return null;
 	node.computeWorldMatrix(true);
@@ -350,51 +343,14 @@ function rotateVector(vector, rotation) {
 	return result;
 }
 
-function remapRelativeRotation(relative, axisAlignment) {
-	var alignment = axisAlignment || BABYLON.Quaternion.Identity();
-	return alignment.multiply(relative).multiply(BABYLON.Quaternion.Inverse(alignment));
-}
-
-function createCalibration(sourcePose, tracker, translationAlignment, rotationAlignment) {
-	var translation = translationAlignment || BABYLON.Quaternion.Identity();
-	return {
-		source: copyPose(sourcePose),
-		target: {
-			position: tracker.mesh.position.clone(),
-			rotation: tracker.mesh.rotationQuaternion.clone()
-		},
-		translationAlignment: translation.clone(),
-		rotationAlignment: (rotationAlignment || translation).clone()
-	};
-}
-
-// Map motion in the source's calibration frame into the target tracker's
-// anatomical frame. Translation and rotation both remain relative, which is
-// the key to controlling a lying character from a standing play space.
-function mapCalibratedPose(sourcePose, calibration) {
-	var inverseSource = BABYLON.Quaternion.Inverse(calibration.source.rotation);
-	var sourceDelta = sourcePose.position.subtract(calibration.source.position);
-	var sourceLocalDelta = rotateVector(sourceDelta, inverseSource);
-	var alignedDelta = rotateVector(sourceLocalDelta, calibration.translationAlignment);
-	var targetDelta = rotateVector(alignedDelta, calibration.target.rotation);
-
-	var sourceRelativeRotation = inverseSource.multiply(sourcePose.rotation);
-	var targetRelativeRotation = remapRelativeRotation(sourceRelativeRotation, calibration.rotationAlignment);
-	var targetRotation = calibration.target.rotation.multiply(targetRelativeRotation);
-	targetRotation.normalize();
-
-	return {
-		position: calibration.target.position.add(targetDelta),
-		rotation: targetRotation
-	};
-}
-
-function applyVrPose(tracker, sourcePose, calibration) {
-	if (!tracker || !sourcePose || !calibration) return;
-	var mapped = mapCalibratedPose(sourcePose, calibration);
-	tracker.mesh.position.copyFrom(mapped.position);
-	tracker.mesh.rotationQuaternion.copyFrom(mapped.rotation);
+function attachTrackerToXrNode(tracker, node, childRotation) {
+	if (!tracker || !node) return false;
+	tracker.xrNode = node;
+	tracker.mesh.parent = node;
+	tracker.mesh.position.copyFromFloats(0, 0, 0);
+	tracker.mesh.rotationQuaternion.copyFrom(childRotation || BABYLON.Quaternion.Identity());
 	setTrackerEngaged(tracker, true);
+	return true;
 }
 
 function horizontalForward(rotation) {
@@ -416,7 +372,9 @@ function recenterVrMenu(force) {
 	if (!force && !outsideFollowCone) return;
 	vr.menu.plane.position.copyFrom(cameraPose.position.add(forward.scale(1.15)));
 	vr.menu.plane.position.y = cameraPose.position.y - 0.12;
-	vr.menu.plane.lookAt(cameraPose.position, 0, 0, 0, BABYLON.Space.WORLD);
+	// Babylon GUI is drawn on the plane's front face. The yaw correction turns
+	// that face toward the HMD instead of showing the mirrored back face.
+	vr.menu.plane.lookAt(cameraPose.position, Math.PI, 0, 0, BABYLON.Space.WORLD);
 }
 
 function placeStageInFront() {
@@ -451,7 +409,7 @@ function setStageDistance(value) {
 		if (vr.menu.distanceLabel) vr.menu.distanceLabel.text = "Scene distance: " + next.toFixed(1) + " m";
 	}
 	if (!changed || !vr.active || !vr.experience) return;
-	if (placeStageInFront() && !vr.trackingPaused) calibrateVrTracking(false);
+	placeStageInFront();
 }
 
 function controllerNode(source) {
@@ -480,50 +438,41 @@ function trackerForControllerMode(side, mode) {
 	return trackerFor(vr.player, controllerTargetSide(side) + (mode === "foot" ? " foot" : " hand"));
 }
 
-function calibrateController(side, mode) {
+function attachControllerTracker(side, mode) {
 	var state = vr.controllers[side];
-	var sourcePose = nodePoseInStage(controllerNode(state.source));
-	if (!sourcePose) {
-		state.calibration = null;
-		return;
-	}
-	var previousTracker = trackerForControllerMode(side, state.mode);
+	var node = controllerNode(state.source);
+	if (!node) return false;
+	var previousTracker = state.attachedTracker;
 	var targetTracker = trackerForControllerMode(side, mode);
-	if (previousTracker !== targetTracker) setTrackerEngaged(previousTracker, false);
-	syncDisengagedTrackers();
+	if (previousTracker && previousTracker !== targetTracker) setTrackerEngaged(previousTracker, false);
 	state.mode = mode;
-	state.calibration = createCalibration(sourcePose, targetTracker, BABYLON.Quaternion.Identity());
-	setTrackerEngaged(targetTracker, true);
+	state.attachedTracker = targetTracker;
+	var attached = attachTrackerToXrNode(targetTracker, node, BABYLON.Quaternion.Identity());
+	syncDisengagedTrackers();
+	return attached;
 }
 
 function updateController(side) {
 	var state = vr.controllers[side];
 	if (!state.source) return;
 	var desiredMode = triggerPressed(state.source) ? "foot" : "hand";
-	if (!state.calibration || desiredMode !== state.mode) calibrateController(side, desiredMode);
-	var sourcePose = nodePoseInStage(controllerNode(state.source));
-	applyVrPose(trackerForControllerMode(side, state.mode), sourcePose, state.calibration);
+	var node = controllerNode(state.source);
+	if (desiredMode !== state.mode || !state.attachedTracker || state.attachedTracker.xrNode !== node) {
+		attachControllerTracker(side, desiredMode);
+	}
 }
 
-function calibrateVrTracking(moveStage) {
+function attachVrTracking(moveStage) {
 	if (!vr.active || !vr.experience) return false;
 	if (moveStage && !placeStageInFront()) return false;
 	releasePlayerTrackers(vr.player);
 	var headTracker = trackerFor(vr.player, "head");
-	var headPose = nodePoseInStage(vr.experience.baseExperience.camera);
-	if (!headPose) return false;
-	vr.headCalibration = createCalibration(
-		headPose,
-		headTracker,
-		headTranslationAlignment,
-		headRotationAlignment
-	);
-	setTrackerEngaged(headTracker, true);
+	if (!attachTrackerToXrNode(headTracker, vr.experience.baseExperience.camera, headChildRotation)) return false;
 	["left", "right"].forEach(function (side) {
 		var state = vr.controllers[side];
-		state.calibration = null;
+		state.attachedTracker = null;
 		state.mode = triggerPressed(state.source) ? "foot" : "hand";
-		if (state.source) calibrateController(side, state.mode);
+		if (state.source) attachControllerTracker(side, state.mode);
 	});
 	return true;
 }
@@ -531,7 +480,7 @@ function calibrateVrTracking(moveStage) {
 function startVrTracking() {
 	if (!vr.active) return;
 	vr.trackingPaused = false;
-	if (!calibrateVrTracking(!vr.stagePlaced)) {
+	if (!attachVrTracking(!vr.stagePlaced)) {
 		vr.trackingPaused = true;
 		setVrStatus("Move the headset, then try Start again", "unavailable");
 		return;
@@ -542,10 +491,9 @@ function startVrTracking() {
 	refreshVrStatus();
 }
 
-function clearVrCalibrations() {
-	vr.headCalibration = null;
+function clearVrAttachments() {
 	["left", "right"].forEach(function (side) {
-		vr.controllers[side].calibration = null;
+		vr.controllers[side].attachedTracker = null;
 		vr.controllers[side].mode = "hand";
 	});
 }
@@ -554,7 +502,7 @@ function releaseVrTracking() {
 	vr.started = false;
 	vr.trackingPaused = true;
 	vr.menuLocked = false;
-	clearVrCalibrations();
+	clearVrAttachments();
 	byId("positionSelect").disabled = false;
 	releaseAllTrackers();
 	refreshVrStatus();
@@ -565,7 +513,7 @@ function stopVrTracking() {
 	vr.trackingPaused = false;
 	vr.stagePlaced = false;
 	vr.menuLocked = false;
-	clearVrCalibrations();
+	clearVrAttachments();
 	byId("positionSelect").disabled = false;
 	releasePlayerTrackers(vr.player);
 }
@@ -580,9 +528,8 @@ function updateVrInput() {
 	if (!vr.active || !vr.experience) return;
 	if (!vr.started) recenterVrMenu(false);
 	if (vr.trackingPaused) return;
-	if (!vr.headCalibration && !calibrateVrTracking(!vr.stagePlaced)) return;
-	var headPose = nodePoseInStage(vr.experience.baseExperience.camera);
-	applyVrPose(trackerFor(vr.player, "head"), headPose, vr.headCalibration);
+	var headTracker = trackerFor(vr.player, "head");
+	if (!headTracker.xrNode && !attachVrTracking(!vr.stagePlaced)) return;
 	updateController("left");
 	updateController("right");
 	refreshVrStatus();
@@ -609,9 +556,9 @@ function setControlledPlayer(value) {
 	var select = byId("vrPlayerSelect");
 	if (select) select.value = String(next);
 	if (next !== previous) {
-		clearVrCalibrations();
+		clearVrAttachments();
 		releasePlayerTrackers(previous);
-		if (vr.active && !vr.trackingPaused) calibrateVrTracking(false);
+		if (vr.active && !vr.trackingPaused) attachVrTracking(false);
 	}
 	refreshVrStatus();
 }
@@ -819,8 +766,8 @@ function registerVrController(source) {
 	var side = source.inputSource && source.inputSource.handedness;
 	if (side !== "left" && side !== "right") return;
 	vr.controllers[side].source = source;
-	vr.controllers[side].calibration = null;
-	if (vr.active && !vr.trackingPaused) calibrateController(side, triggerPressed(source) ? "foot" : "hand");
+	vr.controllers[side].attachedTracker = null;
+	if (vr.active && !vr.trackingPaused) attachControllerTracker(side, triggerPressed(source) ? "foot" : "hand");
 	refreshVrStatus();
 }
 
@@ -831,7 +778,7 @@ function unregisterVrController(source) {
 		setTrackerEngaged(trackerForControllerMode(side, "hand"), false);
 		setTrackerEngaged(trackerForControllerMode(side, "foot"), false);
 		state.source = null;
-		state.calibration = null;
+		state.attachedTracker = null;
 		state.mode = "hand";
 	});
 	refreshVrStatus();
@@ -863,12 +810,12 @@ async function initXR() {
 				vr.trackingPaused = false;
 				vr.stagePlaced = false;
 				vr.menuLocked = false;
-				clearVrCalibrations();
+				clearVrAttachments();
 				if (vr.menu) vr.menu.plane.setEnabled(true);
 				recenterVrMenu(true);
 				// Entering VR immediately starts a live pose preview. Start only
 				// locks the chosen position and menu placement.
-				calibrateVrTracking(true);
+				attachVrTracking(true);
 			} else if (state === BABYLON.WebXRState.NOT_IN_XR) {
 				stopVrTracking();
 				vr.active = false;
@@ -891,7 +838,12 @@ function trackerEffectors(stiffness) {
 	var list = [];
 	trackers.forEach(function (t) {
 		if (!t.engaged) return;
-		var pos = t.mesh.position;
+		// XR trackers are literal children of the HMD/controller nodes. Convert
+		// the child mesh's world transform back into solver-stage coordinates;
+		// desktop tracker gizmos use the same path.
+		var pose = nodePoseInStage(t.mesh);
+		if (!pose) return;
+		var pos = pose.position;
 		// Keep targets above the mat: the solver would refuse anyway, but a
 		// clamped target keeps the pull direction sensible.
 		var y = Math.max(pos.y, 0.02);
@@ -899,9 +851,7 @@ function trackerEffectors(stiffness) {
 		// Orientation: forward axis places the optional aux joint (fingers/toe),
 		// and the opposite side places the back joint (wrist/heel/neck), so
 		// tracker rotation turns its associated body part.
-		// Tracker transforms are local to the movable VR stage. Use the local
-		// rotation here so a stage yaw never leaks into solver coordinates.
-		var fwd = rotateVector(BABYLON.Axis.Z, t.mesh.rotationQuaternion);
+		var fwd = rotateVector(BABYLON.Axis.Z, pose.rotation);
 		if (t.def.aux !== undefined) {
 			var aux = pos.add(fwd.scale(t.auxDist));
 			list.push([t.player, t.def.aux, aux.x, Math.max(aux.y, 0.02), aux.z, stiffness * 0.7]);
@@ -1028,7 +978,7 @@ function loadEntry(index) {
 	currentPose = flatToPose(wasmEngine.pose());
 	updatePlayers(currentPose);
 	releaseAllTrackers();
-	if (vr.active && !vr.trackingPaused) calibrateVrTracking(false);
+	if (vr.active && !vr.trackingPaused) attachVrTracking(false);
 	refreshVrPositionLabel();
 }
 
@@ -1113,18 +1063,18 @@ window.gmDebug = {
 			stageDistance: vr.stageDistance,
 			leftTargetSide: controllerTargetSide("left"),
 			rightTargetSide: controllerTargetSide("right"),
+			headParented: !!trackerFor(vr.player, "head").xrNode,
+			leftParented: !!(vr.controllers.left.attachedTracker && vr.controllers.left.attachedTracker.xrNode),
+			rightParented: !!(vr.controllers.right.attachedTracker && vr.controllers.right.attachedTracker.xrNode),
 			leftMode: vr.controllers.left.mode,
 			rightMode: vr.controllers.right.mode
 		};
 	},
-	// Pure mapping probe used by automated desktop tests: an HMD roll must
-	// change the neck-to-head direction rather than spinning invisibly.
+	// Direct-parenting probe: a parent HMD roll rotates the fixed child axis.
 	headTiltProbe: function (degrees) {
-		var tracker = trackerFor(vr.player, "head");
-		var before = rotateVector(BABYLON.Axis.Z, tracker.mesh.rotationQuaternion);
-		var relative = BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z, degrees * Math.PI / 180);
-		var mapped = remapRelativeRotation(relative, headRotationAlignment);
-		var afterRotation = tracker.mesh.rotationQuaternion.multiply(mapped);
+		var before = rotateVector(BABYLON.Axis.Z, headChildRotation);
+		var parentRoll = BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z, degrees * Math.PI / 180);
+		var afterRotation = parentRoll.multiply(headChildRotation);
 		var after = rotateVector(BABYLON.Axis.Z, afterRotation);
 		return {
 			before: { x: before.x, y: before.y, z: before.z },

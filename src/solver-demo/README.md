@@ -48,6 +48,11 @@ All three requests should return `200`. The WASM response should use
 7. Hold a controller trigger to clutch that side from the hand to the foot;
    release it to return to the hand.
 
+XR input uses direct transform parenting: the active head, hand, or foot
+tracker gizmo is a zero-offset child of the headset or controller node. The
+solver reads that child's world pose in stage coordinates without an
+intermediate motion-calibration transform.
+
 The floating panel also provides **Reset pose** and **Release trackers**.
 Releasing trackers pauses VR control until **Resume controls** is pressed.
 Before Start, the setup menu recenters when the headset turns more than 30
