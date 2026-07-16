@@ -40,7 +40,6 @@ var TRACKER_DEFS = [
 var trackers = []; // { player, def, mesh, engaged, xrNode, auxDist, auxBackDist }
 var gizmoManager = null;
 var selectedTracker = null;
-var headChildRotation = null;
 
 // WebXR controls one selected grappler by parenting tracker gizmos directly to
 // the headset and controller transform nodes. No pose-delta calibration layer
@@ -49,6 +48,7 @@ var vr = {
 	supported: false,
 	active: false,
 	started: false,
+	headTrackingStarted: false,
 	trackingPaused: false,
 	stagePlaced: false,
 	menuLocked: false,
@@ -88,9 +88,6 @@ function initScene() {
 	light.intensity = 0.9;
 	stageRoot = new BABYLON.TransformNode("grappler-stage", scene);
 	stageRoot.rotationQuaternion = BABYLON.Quaternion.Identity();
-	// As a direct child of the HMD, rotate the head gizmo so its +Z axis
-	// (neck-to-head) follows the headset's +Y up axis.
-	headChildRotation = BABYLON.Quaternion.RotationAxis(BABYLON.Axis.X, -Math.PI / 2);
 
 	var red = new BABYLON.StandardMaterial("redskin", scene);
 	var blue = new BABYLON.StandardMaterial("blueskin", scene);
@@ -222,6 +219,7 @@ function setTrackerEngaged(t, engaged) {
 	if (!engaged && t.xrNode) {
 		t.xrNode = null;
 		t.mesh.parent = stageRoot;
+		t.mesh.isPickable = true;
 	}
 	if (t.engaged === engaged) return;
 	t.engaged = engaged;
@@ -343,12 +341,27 @@ function rotateVector(vector, rotation) {
 	return result;
 }
 
-function attachTrackerToXrNode(tracker, node, childRotation) {
+function attachTrackerToXrNode(tracker, node) {
 	if (!tracker || !node) return false;
+	// Capture the gizmo's current world pose before reparenting. The resulting
+	// child transform is the existing tracker-to-controller offset, so movement
+	// follows the controller without snapping the target onto the hardware.
+	var trackerPose = nodeWorldPose(tracker.mesh);
+	var parentPose = nodeWorldPose(node);
+	if (!trackerPose || !parentPose) return false;
+	node.computeWorldMatrix(true);
+	var inverseParent = node.getWorldMatrix().clone();
+	inverseParent.invert();
+	var localPosition = BABYLON.Vector3.TransformCoordinates(trackerPose.position, inverseParent);
+	var localRotation = BABYLON.Quaternion.Inverse(parentPose.rotation).multiply(trackerPose.rotation);
+	localRotation.normalize();
 	tracker.xrNode = node;
 	tracker.mesh.parent = node;
-	tracker.mesh.position.copyFromFloats(0, 0, 0);
-	tracker.mesh.rotationQuaternion.copyFrom(childRotation || BABYLON.Quaternion.Identity());
+	tracker.mesh.position.copyFrom(localPosition);
+	tracker.mesh.rotationQuaternion.copyFrom(localRotation);
+	// An attached tracker can otherwise sit in front of its controller ray and
+	// steal pointer hits from the floating GUI.
+	tracker.mesh.isPickable = false;
 	setTrackerEngaged(tracker, true);
 	return true;
 }
@@ -447,7 +460,7 @@ function attachControllerTracker(side, mode) {
 	if (previousTracker && previousTracker !== targetTracker) setTrackerEngaged(previousTracker, false);
 	state.mode = mode;
 	state.attachedTracker = targetTracker;
-	var attached = attachTrackerToXrNode(targetTracker, node, BABYLON.Quaternion.Identity());
+	var attached = attachTrackerToXrNode(targetTracker, node);
 	syncDisengagedTrackers();
 	return attached;
 }
@@ -462,12 +475,25 @@ function updateController(side) {
 	}
 }
 
-function attachVrTracking(moveStage) {
+function eitherTriggerPressed() {
+	return triggerPressed(vr.controllers.left.source) || triggerPressed(vr.controllers.right.source);
+}
+
+function attachHeadTracker() {
+	var headTracker = trackerFor(vr.player, "head");
+	if (headTracker.xrNode) return true;
+	if (!attachTrackerToXrNode(headTracker, vr.experience.baseExperience.camera)) return false;
+	vr.headTrackingStarted = true;
+	return true;
+}
+
+function attachVrTracking(moveStage, resetHeadGate) {
 	if (!vr.active || !vr.experience) return false;
 	if (moveStage && !placeStageInFront()) return false;
+	var reattachHead = vr.headTrackingStarted && !resetHeadGate;
 	releasePlayerTrackers(vr.player);
-	var headTracker = trackerFor(vr.player, "head");
-	if (!attachTrackerToXrNode(headTracker, vr.experience.baseExperience.camera, headChildRotation)) return false;
+	if (resetHeadGate) vr.headTrackingStarted = false;
+	else if (reattachHead && !attachHeadTracker()) return false;
 	["left", "right"].forEach(function (side) {
 		var state = vr.controllers[side];
 		state.attachedTracker = null;
@@ -480,7 +506,7 @@ function attachVrTracking(moveStage) {
 function startVrTracking() {
 	if (!vr.active) return;
 	vr.trackingPaused = false;
-	if (!attachVrTracking(!vr.stagePlaced)) {
+	if (!attachVrTracking(!vr.stagePlaced, false)) {
 		vr.trackingPaused = true;
 		setVrStatus("Move the headset, then try Start again", "unavailable");
 		return;
@@ -492,6 +518,7 @@ function startVrTracking() {
 }
 
 function clearVrAttachments() {
+	vr.headTrackingStarted = false;
 	["left", "right"].forEach(function (side) {
 		vr.controllers[side].attachedTracker = null;
 		vr.controllers[side].mode = "hand";
@@ -528,8 +555,7 @@ function updateVrInput() {
 	if (!vr.active || !vr.experience) return;
 	if (!vr.started) recenterVrMenu(false);
 	if (vr.trackingPaused) return;
-	var headTracker = trackerFor(vr.player, "head");
-	if (!headTracker.xrNode && !attachVrTracking(!vr.stagePlaced)) return;
+	if (!vr.headTrackingStarted && eitherTriggerPressed()) attachHeadTracker();
 	updateController("left");
 	updateController("right");
 	refreshVrStatus();
@@ -558,7 +584,7 @@ function setControlledPlayer(value) {
 	if (next !== previous) {
 		clearVrAttachments();
 		releasePlayerTrackers(previous);
-		if (vr.active && !vr.trackingPaused) attachVrTracking(false);
+		if (vr.active && !vr.trackingPaused) attachVrTracking(false, true);
 	}
 	refreshVrStatus();
 }
@@ -592,12 +618,13 @@ function refreshVrStatus() {
 		text = "trackers released - Start to resume";
 		className = "ready";
 	} else if (!vr.started) {
-		text = "live preview - controlling " + playerName;
+		text = "live preview - " + playerName + (vr.headTrackingStarted ? ", head active" : ", trigger starts head");
 		className = "active";
 	} else {
 		var left = vr.controllers.left.source ? vr.controllers.left.mode : "waiting";
 		var right = vr.controllers.right.source ? vr.controllers.right.mode : "waiting";
-		text = "active - " + playerName + ", head, L " + left + ", R " + right;
+		var head = vr.headTrackingStarted ? "head" : "head waiting";
+		text = "active - " + playerName + ", " + head + ", L " + left + ", R " + right;
 		className = "active";
 	}
 	if (text !== vr.lastStatus) {
@@ -815,7 +842,7 @@ async function initXR() {
 				recenterVrMenu(true);
 				// Entering VR immediately starts a live pose preview. Start only
 				// locks the chosen position and menu placement.
-				attachVrTracking(true);
+				attachVrTracking(true, true);
 			} else if (state === BABYLON.WebXRState.NOT_IN_XR) {
 				stopVrTracking();
 				vr.active = false;
@@ -978,7 +1005,7 @@ function loadEntry(index) {
 	currentPose = flatToPose(wasmEngine.pose());
 	updatePlayers(currentPose);
 	releaseAllTrackers();
-	if (vr.active && !vr.trackingPaused) attachVrTracking(false);
+	if (vr.active && !vr.trackingPaused) attachVrTracking(false, true);
 	refreshVrPositionLabel();
 }
 
@@ -1057,6 +1084,7 @@ window.gmDebug = {
 			supported: vr.supported,
 			active: vr.active,
 			started: vr.started,
+			headTrackingStarted: vr.headTrackingStarted,
 			trackingPaused: vr.trackingPaused,
 			menuLocked: vr.menuLocked,
 			player: vr.player,
@@ -1070,11 +1098,12 @@ window.gmDebug = {
 			rightMode: vr.controllers.right.mode
 		};
 	},
-	// Direct-parenting probe: a parent HMD roll rotates the fixed child axis.
+	// Direct-parenting probe: a parent HMD roll rotates the stored child offset.
 	headTiltProbe: function (degrees) {
-		var before = rotateVector(BABYLON.Axis.Z, headChildRotation);
+		var childRotation = trackerFor(vr.player, "head").mesh.rotationQuaternion;
+		var before = rotateVector(BABYLON.Axis.Z, childRotation);
 		var parentRoll = BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z, degrees * Math.PI / 180);
-		var afterRotation = parentRoll.multiply(headChildRotation);
+		var afterRotation = parentRoll.multiply(childRotation);
 		var after = rotateVector(BABYLON.Axis.Z, afterRotation);
 		return {
 			before: { x: before.x, y: before.y, z: before.z },

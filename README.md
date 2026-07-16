@@ -55,11 +55,11 @@ XPBD constraint solver compiled to WebAssembly (`src/solver-demo/pkg/`, built
 with `wasm-pack`). Each grappler carries five 6-DOF trackers — hands, feet, and
 head, like a VR tracker rig. On desktop you engage a tracker and move it with
 the gizmo; in a headset the trackers follow your controllers or hand tracking,
-with the active gizmo parented directly to its XR transform. The body follows
-under gravity, muscle tone, and anatomy limits. Positions
-are loaded from the top-level `GrappleMap.txt`. In VR, choose whether to drive
-the red or blue grappler; live tracking starts as soon as the immersive session
-opens, before the starting pose is locked. The floating panel includes pose
+with the active gizmo parented to its XR transform while preserving its current
+offset. The body follows under gravity, muscle tone, and anatomy limits.
+Positions are loaded from the top-level `GrappleMap.txt`. In VR, choose whether
+to drive the red or blue grappler; live tracking starts as soon as the immersive
+session opens, before the starting pose is locked. The floating panel includes pose
 reset, tracker release, stiffness, and scene-distance controls.
 
 **Live build:** https://grapplemap-solver-vr.web.app
