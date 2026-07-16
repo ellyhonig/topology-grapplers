@@ -1,0 +1,16 @@
+{
+  "name": "gm-wasm",
+  "type": "module",
+  "version": "0.1.0",
+  "license": "CC0-1.0",
+  "files": [
+    "gm_wasm_bg.wasm",
+    "gm_wasm.js",
+    "gm_wasm.d.ts"
+  ],
+  "main": "gm_wasm.js",
+  "types": "gm_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
