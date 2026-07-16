@@ -30,13 +30,25 @@
 		<aside class="controls">
 			<header>
 				<h1>Rust XPBD Solver</h1>
-				<p>Each grappler carries five 6-DOF trackers - hands, feet, and head. Mouse gizmos still work, or enter VR to drive the red grappler in third person with a headset and two controllers.</p>
+				<p>Each grappler carries five 6-DOF trackers - hands, feet, and head. Mouse gizmos still work, or enter VR to drive either grappler in third person with a headset and two controllers.</p>
 			</header>
 
 			<section class="vr-card">
 				<h2>VR controls</h2>
-				<p>Enter VR, choose a starting position in the floating menu, then press Start. The headset drives the head. Controllers drive the matching hands; hold either trigger to clutch that controller over to its matching foot.</p>
+				<p>Enter VR and the selected grappler immediately follows you while you choose a pose. Start locks the starting position. The headset drives the head; each controller drives the limb on its side, and holding its trigger clutches control to that foot.</p>
+				<label class="field">
+					<span>VR-controlled grappler</span>
+					<select id="vrPlayerSelect">
+						<option value="0">Red grappler</option>
+						<option value="1">Blue grappler</option>
+					</select>
+				</label>
+				<label class="range">
+					<span>VR scene distance <output id="sceneDistanceOut">1.6 m</output></span>
+					<input id="sceneDistance" type="range" min="1" max="3" value="1.6" step="0.1">
+				</label>
 				<button id="vrStartBtn" type="button" disabled>Start VR controls</button>
+				<p class="hint">Position, player, distance, stiffness, reset, and tracker-release controls are also available in the floating VR panel.</p>
 			</section>
 
 			<label class="field">

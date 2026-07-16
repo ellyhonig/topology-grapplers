@@ -37,16 +37,21 @@ All three requests should return `200`. The WASM response should use
 ## VR controls
 
 1. Open the demo in a WebXR-capable headset browser and choose **Enter VR**.
-2. Choose a starting GrappleMap position in the floating menu.
-3. Press **Start**.
-4. Move the headset to drive the red grappler's head.
-5. Move the left and right controllers to drive the matching hands.
-6. Hold a controller trigger to clutch that side from the hand to the foot;
+2. The selected grappler immediately follows the headset and controllers while
+   the setup menu remains available.
+3. Choose a starting GrappleMap position and either the red or blue grappler.
+4. Adjust scene distance or tracker stiffness if needed, then press **Start**
+   to lock the position choice.
+5. Move the headset to drive the selected grappler's head.
+6. Move the left and right controllers to drive the limbs on the corresponding
+   sides.
+7. Hold a controller trigger to clutch that side from the hand to the foot;
    release it to return to the hand.
 
+The floating panel also provides **Reset pose** and **Release trackers**.
+Releasing trackers pauses VR control until **Resume controls** is pressed.
 Before Start, the setup menu recenters when the headset turns more than 30
-degrees away from it. After Start, the menu and grappler stage stay locked in
-the play space.
+degrees away from it. After Start, the menu stays locked in the play space.
 
 ## Headset access and port forwarding
 

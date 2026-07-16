@@ -40,16 +40,21 @@ var TRACKER_DEFS = [
 var trackers = []; // { player, def, mesh, engaged, auxDist, auxBackDist }
 var gizmoManager = null;
 var selectedTracker = null;
-var headAxisAlignment = null;
+var headTranslationAlignment = null;
+var headRotationAlignment = null;
 
-// WebXR controls player 0 (the red grappler). All source poses are calibrated
-// against the current tracker pose, so a standing player can control a
-// grappler in any orientation without snapping the body upright.
+// WebXR controls one selected grappler. All source poses are calibrated against
+// the current tracker pose, so a standing player can control a grappler in any
+// orientation without snapping the body upright.
 var vr = {
 	supported: false,
 	active: false,
 	started: false,
+	trackingPaused: false,
+	stagePlaced: false,
 	menuLocked: false,
+	player: 0,
+	stageDistance: 1.6,
 	experience: null,
 	menu: null,
 	headCalibration: null,
@@ -86,8 +91,11 @@ function initScene() {
 	stageRoot = new BABYLON.TransformNode("grappler-stage", scene);
 	stageRoot.rotationQuaternion = BABYLON.Quaternion.Identity();
 	// HMD local +Y (head-up) maps to the head gizmo's local +Z
-	// (neck-to-head). This makes an HMD roll bend the avatar's neck.
-	headAxisAlignment = BABYLON.Quaternion.RotationAxis(BABYLON.Axis.X, Math.PI / 2);
+	// (neck-to-head). Translation keeps HMD left/right unchanged. Rotation uses
+	// the opposite quarter-turn so HMD roll bends the neck in the same direction
+	// instead of mirroring the user's lean.
+	headTranslationAlignment = BABYLON.Quaternion.RotationAxis(BABYLON.Axis.X, Math.PI / 2);
+	headRotationAlignment = BABYLON.Quaternion.RotationAxis(BABYLON.Axis.X, -Math.PI / 2);
 
 	var red = new BABYLON.StandardMaterial("redskin", scene);
 	var blue = new BABYLON.StandardMaterial("blueskin", scene);
@@ -347,14 +355,16 @@ function remapRelativeRotation(relative, axisAlignment) {
 	return alignment.multiply(relative).multiply(BABYLON.Quaternion.Inverse(alignment));
 }
 
-function createCalibration(sourcePose, tracker, axisAlignment) {
+function createCalibration(sourcePose, tracker, translationAlignment, rotationAlignment) {
+	var translation = translationAlignment || BABYLON.Quaternion.Identity();
 	return {
 		source: copyPose(sourcePose),
 		target: {
 			position: tracker.mesh.position.clone(),
 			rotation: tracker.mesh.rotationQuaternion.clone()
 		},
-		axisAlignment: (axisAlignment || BABYLON.Quaternion.Identity()).clone()
+		translationAlignment: translation.clone(),
+		rotationAlignment: (rotationAlignment || translation).clone()
 	};
 }
 
@@ -365,11 +375,11 @@ function mapCalibratedPose(sourcePose, calibration) {
 	var inverseSource = BABYLON.Quaternion.Inverse(calibration.source.rotation);
 	var sourceDelta = sourcePose.position.subtract(calibration.source.position);
 	var sourceLocalDelta = rotateVector(sourceDelta, inverseSource);
-	var alignedDelta = rotateVector(sourceLocalDelta, calibration.axisAlignment);
+	var alignedDelta = rotateVector(sourceLocalDelta, calibration.translationAlignment);
 	var targetDelta = rotateVector(alignedDelta, calibration.target.rotation);
 
 	var sourceRelativeRotation = inverseSource.multiply(sourcePose.rotation);
-	var targetRelativeRotation = remapRelativeRotation(sourceRelativeRotation, calibration.axisAlignment);
+	var targetRelativeRotation = remapRelativeRotation(sourceRelativeRotation, calibration.rotationAlignment);
 	var targetRotation = calibration.target.rotation.multiply(targetRelativeRotation);
 	targetRotation.normalize();
 
@@ -417,11 +427,31 @@ function placeStageInFront() {
 	var yaw = Math.atan2(forward.x, forward.z);
 	var eyeHeight = xrCamera.realWorldHeight;
 	if (!Number.isFinite(eyeHeight) || eyeHeight < 0.8) eyeHeight = 1.65;
-	stageRoot.position.copyFrom(cameraPose.position.add(forward.scale(2.4)));
+	stageRoot.position.copyFrom(cameraPose.position.add(forward.scale(vr.stageDistance)));
 	stageRoot.position.y = cameraPose.position.y - eyeHeight;
 	stageRoot.rotationQuaternion.copyFrom(BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Y, yaw));
 	stageRoot.computeWorldMatrix(true);
+	vr.stagePlaced = true;
 	return true;
+}
+
+function setStageDistance(value) {
+	var next = Math.max(1, Math.min(3, Math.round(Number(value) * 10) / 10));
+	if (!Number.isFinite(next)) return;
+	var changed = next !== vr.stageDistance;
+	vr.stageDistance = next;
+	var input = byId("sceneDistance");
+	var output = byId("sceneDistanceOut");
+	if (input && Number(input.value) !== next) input.value = next;
+	if (output) output.textContent = next.toFixed(1) + " m";
+	if (vr.menu) {
+		if (vr.menu.distance && Math.abs(vr.menu.distance.value - next) > 0.001) {
+			vr.menu.distance.value = next;
+		}
+		if (vr.menu.distanceLabel) vr.menu.distanceLabel.text = "Scene distance: " + next.toFixed(1) + " m";
+	}
+	if (!changed || !vr.active || !vr.experience) return;
+	if (placeStageInFront() && !vr.trackingPaused) calibrateVrTracking(false);
 }
 
 function controllerNode(source) {
@@ -440,8 +470,14 @@ function triggerPressed(source) {
 		(gamepad.buttons[0].pressed || gamepad.buttons[0].value >= 0.55));
 }
 
+function controllerTargetSide(side) {
+	// The GrappleMap rig is presented face-to-face in third person, so WebXR
+	// handedness must be mirrored to reach the limb on the user's same side.
+	return side === "left" ? "right" : "left";
+}
+
 function trackerForControllerMode(side, mode) {
-	return trackerFor(0, side + (mode === "foot" ? " foot" : " hand"));
+	return trackerFor(vr.player, controllerTargetSide(side) + (mode === "foot" ? " foot" : " hand"));
 }
 
 function calibrateController(side, mode) {
@@ -472,11 +508,16 @@ function updateController(side) {
 function calibrateVrTracking(moveStage) {
 	if (!vr.active || !vr.experience) return false;
 	if (moveStage && !placeStageInFront()) return false;
-	releasePlayerTrackers(0);
-	var headTracker = trackerFor(0, "head");
+	releasePlayerTrackers(vr.player);
+	var headTracker = trackerFor(vr.player, "head");
 	var headPose = nodePoseInStage(vr.experience.baseExperience.camera);
 	if (!headPose) return false;
-	vr.headCalibration = createCalibration(headPose, headTracker, headAxisAlignment);
+	vr.headCalibration = createCalibration(
+		headPose,
+		headTracker,
+		headTranslationAlignment,
+		headRotationAlignment
+	);
 	setTrackerEngaged(headTracker, true);
 	["left", "right"].forEach(function (side) {
 		var state = vr.controllers[side];
@@ -489,7 +530,9 @@ function calibrateVrTracking(moveStage) {
 
 function startVrTracking() {
 	if (!vr.active) return;
-	if (!calibrateVrTracking(true)) {
+	vr.trackingPaused = false;
+	if (!calibrateVrTracking(!vr.stagePlaced)) {
+		vr.trackingPaused = true;
 		setVrStatus("Move the headset, then try Start again", "unavailable");
 		return;
 	}
@@ -499,16 +542,32 @@ function startVrTracking() {
 	refreshVrStatus();
 }
 
-function stopVrTracking() {
-	vr.started = false;
-	vr.menuLocked = false;
+function clearVrCalibrations() {
 	vr.headCalibration = null;
 	["left", "right"].forEach(function (side) {
 		vr.controllers[side].calibration = null;
 		vr.controllers[side].mode = "hand";
 	});
+}
+
+function releaseVrTracking() {
+	vr.started = false;
+	vr.trackingPaused = true;
+	vr.menuLocked = false;
+	clearVrCalibrations();
 	byId("positionSelect").disabled = false;
-	releasePlayerTrackers(0);
+	releaseAllTrackers();
+	refreshVrStatus();
+}
+
+function stopVrTracking() {
+	vr.started = false;
+	vr.trackingPaused = false;
+	vr.stagePlaced = false;
+	vr.menuLocked = false;
+	clearVrCalibrations();
+	byId("positionSelect").disabled = false;
+	releasePlayerTrackers(vr.player);
 }
 
 function restoreDesktopStage() {
@@ -519,12 +578,11 @@ function restoreDesktopStage() {
 
 function updateVrInput() {
 	if (!vr.active || !vr.experience) return;
-	if (!vr.started) {
-		recenterVrMenu(false);
-		return;
-	}
+	if (!vr.started) recenterVrMenu(false);
+	if (vr.trackingPaused) return;
+	if (!vr.headCalibration && !calibrateVrTracking(!vr.stagePlaced)) return;
 	var headPose = nodePoseInStage(vr.experience.baseExperience.camera);
-	applyVrPose(trackerFor(0, "head"), headPose, vr.headCalibration);
+	applyVrPose(trackerFor(vr.player, "head"), headPose, vr.headCalibration);
 	updateController("left");
 	updateController("right");
 	refreshVrStatus();
@@ -544,22 +602,55 @@ function refreshVrPositionLabel() {
 	vr.menu.position.text = option ? option.textContent : "No position";
 }
 
+function setControlledPlayer(value) {
+	var next = Number(value) === 1 ? 1 : 0;
+	var previous = vr.player;
+	vr.player = next;
+	var select = byId("vrPlayerSelect");
+	if (select) select.value = String(next);
+	if (next !== previous) {
+		clearVrCalibrations();
+		releasePlayerTrackers(previous);
+		if (vr.active && !vr.trackingPaused) calibrateVrTracking(false);
+	}
+	refreshVrStatus();
+}
+
+function setTrackerStiffness(value) {
+	var next = Math.max(0.1, Math.min(1, Math.round(Number(value) * 20) / 20));
+	if (!Number.isFinite(next)) return;
+	var input = byId("stiffness");
+	var output = byId("stiffnessOut");
+	if (input && Number(input.value) !== next) input.value = next;
+	if (output) output.textContent = next.toFixed(2).replace(/0$/, "");
+	if (vr.menu) {
+		if (vr.menu.stiffness && Math.abs(vr.menu.stiffness.value - next) > 0.001) {
+			vr.menu.stiffness.value = next;
+		}
+		if (vr.menu.stiffnessLabel) vr.menu.stiffnessLabel.text = "Tracker stiffness: " + next.toFixed(2).replace(/0$/, "");
+	}
+}
+
 function refreshVrStatus() {
 	var text;
 	var className;
+	var playerName = vr.player === 0 ? "Red" : "Blue";
 	if (!vr.supported) {
 		text = "unavailable";
 		className = "unavailable";
 	} else if (!vr.active) {
 		text = "ready - enter VR";
 		className = "ready";
-	} else if (!vr.started) {
-		text = "choose a position, then Start";
+	} else if (vr.trackingPaused) {
+		text = "trackers released - Start to resume";
 		className = "ready";
+	} else if (!vr.started) {
+		text = "live preview - controlling " + playerName;
+		className = "active";
 	} else {
 		var left = vr.controllers.left.source ? vr.controllers.left.mode : "waiting";
 		var right = vr.controllers.right.source ? vr.controllers.right.mode : "waiting";
-		text = "active - head, L " + left + ", R " + right;
+		text = "active - " + playerName + ", head, L " + left + ", R " + right;
 		className = "active";
 	}
 	if (text !== vr.lastStatus) {
@@ -567,16 +658,26 @@ function refreshVrStatus() {
 		setVrStatus(text, className);
 	}
 	if (vr.menu) {
+		var positionEnabled = vr.active && !vr.started;
 		vr.menu.start.isEnabled = vr.active && !vr.started;
 		vr.menu.previous.isEnabled = vr.active && !vr.started;
 		vr.menu.next.isEnabled = vr.active && !vr.started;
 		vr.menu.start.alpha = vr.started ? 0.45 : 1;
-		vr.menu.previous.alpha = vr.started ? 0.45 : 1;
-		vr.menu.next.alpha = vr.started ? 0.45 : 1;
+		vr.menu.start.textBlock.text = vr.started ? "Controls active" : (vr.trackingPaused ? "Resume controls" : "Start");
+		vr.menu.previous.alpha = positionEnabled ? 1 : 0.45;
+		vr.menu.next.alpha = positionEnabled ? 1 : 0.45;
+		vr.menu.reset.isEnabled = vr.active;
+		vr.menu.release.isEnabled = vr.active && !vr.trackingPaused;
+		vr.menu.reset.alpha = vr.active ? 1 : 0.45;
+		vr.menu.release.alpha = vr.active && !vr.trackingPaused ? 1 : 0.45;
+		vr.menu.playerRed.background = vr.player === 0 ? "#a4261b" : "#35475a";
+		vr.menu.playerBlue.background = vr.player === 1 ? "#234eac" : "#35475a";
 	}
 	var startButton = byId("vrStartBtn");
 	startButton.disabled = !vr.active || vr.started;
-	startButton.textContent = vr.started ? "VR controls active" : "Start VR controls";
+	startButton.textContent = vr.started ? "VR controls active"
+		: vr.trackingPaused ? "Resume VR controls" : "Start VR controls";
+	byId("positionSelect").disabled = vr.started;
 	refreshVrPositionLabel();
 }
 
@@ -595,13 +696,13 @@ function cyclePosition(direction) {
 function createVrMenu() {
 	if (!BABYLON.GUI) return;
 	var plane = BABYLON.MeshBuilder.CreatePlane("vr-setup-menu", {
-		width: 0.9,
-		height: 0.58,
+		width: 1.05,
+		height: 0.98,
 		sideOrientation: BABYLON.Mesh.DOUBLESIDE
 	}, scene);
 	plane.isPickable = true;
 	plane.setEnabled(false);
-	var texture = BABYLON.GUI.AdvancedDynamicTexture.CreateForMesh(plane, 1024, 660, false);
+	var texture = BABYLON.GUI.AdvancedDynamicTexture.CreateForMesh(plane, 1100, 1030, false);
 	var background = new BABYLON.GUI.Rectangle("vr-menu-background");
 	background.background = "#101720";
 	background.color = "#91a5bb";
@@ -609,9 +710,9 @@ function createVrMenu() {
 	background.cornerRadius = 28;
 	texture.addControl(background);
 	var panel = new BABYLON.GUI.StackPanel("vr-menu-panel");
-	panel.width = "900px";
-	panel.paddingTop = "34px";
-	panel.paddingBottom = "26px";
+	panel.width = "970px";
+	panel.paddingTop = "28px";
+	panel.paddingBottom = "22px";
 	background.addControl(panel);
 
 	function addText(name, text, height, size, color) {
@@ -625,36 +726,73 @@ function createVrMenu() {
 	}
 	function makeButton(name, text) {
 		var button = BABYLON.GUI.Button.CreateSimpleButton(name, text);
-		button.height = "82px";
+		button.height = "70px";
 		button.color = "white";
 		button.background = "#245f9e";
 		button.thickness = 2;
 		button.cornerRadius = 15;
-		button.fontSize = 28;
+		button.fontSize = 25;
 		return button;
 	}
+	function makeTwoColumnRow(name, left, right, height) {
+		var row = new BABYLON.GUI.Grid(name);
+		row.height = (height || 78) + "px";
+		row.addColumnDefinition(0.5);
+		row.addColumnDefinition(0.5);
+		left.paddingRight = "7px";
+		right.paddingLeft = "7px";
+		row.addControl(left, 0, 0);
+		row.addControl(right, 0, 1);
+		panel.addControl(row);
+		return row;
+	}
+	function makeSlider(name, minimum, maximum, value, step) {
+		var slider = new BABYLON.GUI.Slider(name);
+		slider.minimum = minimum;
+		slider.maximum = maximum;
+		slider.value = value;
+		slider.step = step;
+		slider.height = "54px";
+		slider.width = "860px";
+		slider.color = "#65b5ff";
+		slider.background = "#34495e";
+		slider.borderColor = "#b9cce0";
+		slider.thumbWidth = "42px";
+		panel.addControl(slider);
+		return slider;
+	}
 
-	addText("vr-menu-title", "GrappleMap VR", 72, 42, "#ffffff");
-	var status = addText("vr-menu-status", "Choose a position, then Start", 72, 24, "#b9cce0");
-	var position = addText("vr-menu-position", "Position", 76, 30, "#ffffff");
-	var row = new BABYLON.GUI.Grid("vr-menu-position-buttons");
-	row.height = "92px";
-	row.addColumnDefinition(0.5);
-	row.addColumnDefinition(0.5);
-	panel.addControl(row);
+	addText("vr-menu-title", "GrappleMap VR", 60, 40, "#ffffff");
+	var status = addText("vr-menu-status", "Live preview", 56, 23, "#b9cce0");
+	var position = addText("vr-menu-position", "Position", 58, 28, "#ffffff");
 	var previous = makeButton("vr-menu-previous", "Previous");
 	var next = makeButton("vr-menu-next", "Next");
-	previous.paddingRight = "8px";
-	next.paddingLeft = "8px";
-	row.addControl(previous, 0, 0);
-	row.addControl(next, 0, 1);
+	makeTwoColumnRow("vr-menu-position-buttons", previous, next);
+	var playerLabel = addText("vr-menu-player-label", "Controlled grappler", 48, 25, "#b9cce0");
+	var playerRed = makeButton("vr-menu-player-red", "Red");
+	var playerBlue = makeButton("vr-menu-player-blue", "Blue");
+	makeTwoColumnRow("vr-menu-player-buttons", playerRed, playerBlue);
+	var distanceLabel = addText("vr-menu-distance-label", "Scene distance: " + vr.stageDistance.toFixed(1) + " m", 46, 24, "#b9cce0");
+	var distance = makeSlider("vr-menu-distance", 1, 3, vr.stageDistance, 0.1);
+	var stiffnessValue = parseFloat(byId("stiffness").value);
+	var stiffnessLabel = addText("vr-menu-stiffness-label", "Tracker stiffness: " + stiffnessValue, 46, 24, "#b9cce0");
+	var stiffness = makeSlider("vr-menu-stiffness", 0.1, 1, stiffnessValue, 0.05);
+	var reset = makeButton("vr-menu-reset", "Reset pose");
+	var release = makeButton("vr-menu-release", "Release trackers");
+	makeTwoColumnRow("vr-menu-action-buttons", reset, release);
 	var start = makeButton("vr-menu-start", "Start");
-	start.height = "94px";
+	start.height = "82px";
 	start.background = "#18864b";
-	start.paddingTop = "12px";
+	start.paddingTop = "8px";
 	panel.addControl(start);
 	previous.onPointerUpObservable.add(function () { cyclePosition(-1); });
 	next.onPointerUpObservable.add(function () { cyclePosition(1); });
+	playerRed.onPointerUpObservable.add(function () { setControlledPlayer(0); });
+	playerBlue.onPointerUpObservable.add(function () { setControlledPlayer(1); });
+	distance.onValueChangedObservable.add(setStageDistance);
+	stiffness.onValueChangedObservable.add(setTrackerStiffness);
+	reset.onPointerUpObservable.add(resetSelectedPose);
+	release.onPointerUpObservable.add(releaseVrTracking);
 	start.onPointerUpObservable.add(startVrTracking);
 	vr.menu = {
 		plane: plane,
@@ -663,9 +801,18 @@ function createVrMenu() {
 		position: position,
 		previous: previous,
 		next: next,
+		playerLabel: playerLabel,
+		playerRed: playerRed,
+		playerBlue: playerBlue,
+		distanceLabel: distanceLabel,
+		distance: distance,
+		stiffnessLabel: stiffnessLabel,
+		stiffness: stiffness,
+		reset: reset,
+		release: release,
 		start: start
 	};
-	refreshVrPositionLabel();
+	refreshVrStatus();
 }
 
 function registerVrController(source) {
@@ -673,7 +820,7 @@ function registerVrController(source) {
 	if (side !== "left" && side !== "right") return;
 	vr.controllers[side].source = source;
 	vr.controllers[side].calibration = null;
-	if (vr.started) calibrateController(side, triggerPressed(source) ? "foot" : "hand");
+	if (vr.active && !vr.trackingPaused) calibrateController(side, triggerPressed(source) ? "foot" : "hand");
 	refreshVrStatus();
 }
 
@@ -712,13 +859,20 @@ async function initXR() {
 		vr.experience.baseExperience.onStateChangedObservable.add(function (state) {
 			if (state === BABYLON.WebXRState.IN_XR) {
 				vr.active = true;
+				vr.started = false;
+				vr.trackingPaused = false;
+				vr.stagePlaced = false;
 				vr.menuLocked = false;
-				vr.menu.plane.setEnabled(true);
+				clearVrCalibrations();
+				if (vr.menu) vr.menu.plane.setEnabled(true);
 				recenterVrMenu(true);
+				// Entering VR immediately starts a live pose preview. Start only
+				// locks the chosen position and menu placement.
+				calibrateVrTracking(true);
 			} else if (state === BABYLON.WebXRState.NOT_IN_XR) {
 				stopVrTracking();
 				vr.active = false;
-				vr.menu.plane.setEnabled(false);
+				if (vr.menu) vr.menu.plane.setEnabled(false);
 				restoreDesktopStage();
 			}
 			refreshVrStatus();
@@ -874,8 +1028,12 @@ function loadEntry(index) {
 	currentPose = flatToPose(wasmEngine.pose());
 	updatePlayers(currentPose);
 	releaseAllTrackers();
-	if (vr.started) calibrateVrTracking(false);
+	if (vr.active && !vr.trackingPaused) calibrateVrTracking(false);
 	refreshVrPositionLabel();
+}
+
+function resetSelectedPose() {
+	loadEntry(parseInt(byId("positionSelect").value, 10));
 }
 
 async function boot() {
@@ -897,20 +1055,27 @@ async function boot() {
 	initScene();
 	refreshTrackerStatus();
 
-	byId("resetBtn").addEventListener("click", function () {
-		loadEntry(parseInt(byId("positionSelect").value, 10));
+	byId("resetBtn").addEventListener("click", resetSelectedPose);
+	byId("releaseBtn").addEventListener("click", function () {
+		if (vr.active) releaseVrTracking();
+		else releaseAllTrackers();
 	});
-	byId("releaseBtn").addEventListener("click", releaseAllTrackers);
 	byId("dualTestBtn").addEventListener("click", function () {
 		if (dualTest) stopDualTest();
 		else startDualTest();
 	});
 	byId("vrStartBtn").addEventListener("click", startVrTracking);
+	byId("vrPlayerSelect").addEventListener("change", function (event) {
+		setControlledPlayer(event.target.value);
+	});
+	byId("sceneDistance").addEventListener("input", function (event) {
+		setStageDistance(event.target.value);
+	});
 	var stiffness = byId("stiffness");
-	var stiffnessOut = byId("stiffnessOut");
-	function syncStiffness() { stiffnessOut.textContent = stiffness.value; }
-	stiffness.addEventListener("input", syncStiffness);
-	syncStiffness();
+	stiffness.addEventListener("input", function (event) { setTrackerStiffness(event.target.value); });
+	setControlledPlayer(byId("vrPlayerSelect").value);
+	setStageDistance(byId("sceneDistance").value);
+	setTrackerStiffness(stiffness.value);
 	await initXR();
 }
 
@@ -942,7 +1107,12 @@ window.gmDebug = {
 			supported: vr.supported,
 			active: vr.active,
 			started: vr.started,
+			trackingPaused: vr.trackingPaused,
 			menuLocked: vr.menuLocked,
+			player: vr.player,
+			stageDistance: vr.stageDistance,
+			leftTargetSide: controllerTargetSide("left"),
+			rightTargetSide: controllerTargetSide("right"),
 			leftMode: vr.controllers.left.mode,
 			rightMode: vr.controllers.right.mode
 		};
@@ -950,10 +1120,10 @@ window.gmDebug = {
 	// Pure mapping probe used by automated desktop tests: an HMD roll must
 	// change the neck-to-head direction rather than spinning invisibly.
 	headTiltProbe: function (degrees) {
-		var tracker = trackerFor(0, "head");
+		var tracker = trackerFor(vr.player, "head");
 		var before = rotateVector(BABYLON.Axis.Z, tracker.mesh.rotationQuaternion);
 		var relative = BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z, degrees * Math.PI / 180);
-		var mapped = remapRelativeRotation(relative, headAxisAlignment);
+		var mapped = remapRelativeRotation(relative, headRotationAlignment);
 		var afterRotation = tracker.mesh.rotationQuaternion.multiply(mapped);
 		var after = rotateVector(BABYLON.Axis.Z, afterRotation);
 		return {
