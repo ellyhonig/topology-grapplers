@@ -35,7 +35,8 @@
 
 			<section class="vr-card">
 				<h2>VR controls</h2>
-				<p>Connect two trackers in SteamVR, enter VR, choose a pose, and position yourself with one tracker on each foot. Point away from the menu and press either controller trigger once to calibrate and start. The lower unhanded SteamVR devices are assigned left/right from their positions at that moment; controllers remain on the hands.</p>
+				<p>Install <code>openvr</code>, then <a href="../scripts/steamvr_tracker_bridge.py" download>download and start the tracker bridge</a> on the SteamVR PC and allow the browser's Local Network Access prompt. Connect two trackers, enter VR, choose a pose, and position yourself with one tracker on each foot. Point away from the menu and press either controller trigger once to calibrate and start. The two lowest generic SteamVR devices are assigned left/right from their positions at that moment; controllers remain on the hands.</p>
+				<p class="hint"><code>python -m pip install openvr</code><br><code>python steamvr_tracker_bridge.py</code></p>
 				<label class="field">
 					<span>VR-controlled grappler</span>
 					<select id="vrPlayerSelect">
@@ -79,6 +80,6 @@
 			</section>
 		</aside>
 	</main>
-	<script type="module" src="solver-demo/main.js"></script>
+	<script type="module" src="solver-demo/main.js?v=steamvr-bridge-1"></script>
 </body>
 </html>
