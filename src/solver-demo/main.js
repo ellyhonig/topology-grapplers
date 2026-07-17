@@ -48,11 +48,10 @@ var gizmoManager = null;
 var selectedTracker = null;
 var headChildRotation = null;
 
-// WebXR controls one selected grappler from the headset and two hand
-// controllers. A loopback bridge supplies SteamVR's generic 6-DOF tracker
-// poses, which Chromium does not expose as WebXR input sources. The first
-// off-menu trigger press calibrates the foot offsets and assigns the two
-// trackers left/right from their positions relative to the headset.
+// WebXR controls one selected grappler from the headset, two hand controllers,
+// and two unhanded 6-DOF input sources exposed by SteamVR for the feet. The
+// first off-menu trigger press calibrates the foot offsets and assigns the two
+// SteamVR trackers left/right from their positions relative to the headset.
 var vr = {
 	supported: false,
 	active: false,
@@ -71,14 +70,6 @@ var vr = {
 		right: { source: null, attachedTracker: null, triggerWasPressed: false, triggerCapturedByUi: false, buttonStates: null }
 	},
 	steamVrTrackers: [], // { source, side, attachedTracker }
-	trackerBridge: {
-		socket: null,
-		accessPending: false,
-		connected: false,
-		error: "",
-		retryTimer: null,
-		sources: new Map()
-	},
 	lastStatus: ""
 };
 
@@ -535,122 +526,6 @@ function controllerNode(source) {
 	return source ? (source.grip || source.pointer || null) : null;
 }
 
-var TRACKER_BRIDGE_URL = "ws://127.0.0.1:17373";
-
-function removeTrackerBridgeSource(id) {
-	var source = vr.trackerBridge.sources.get(id);
-	if (!source) return;
-	vr.trackerBridge.sources.delete(id);
-	unregisterVrInputSource(source);
-	if (source.grip) source.grip.dispose();
-}
-
-function updateTrackerBridgePoses(message) {
-	if (!message || message.type !== "poses" || !Array.isArray(message.trackers)) return;
-	var seen = new Set();
-	message.trackers.forEach(function (pose) {
-		if (!pose || typeof pose.id !== "string" || !Array.isArray(pose.position) ||
-			!Array.isArray(pose.orientation) || pose.position.length !== 3 ||
-			pose.orientation.length !== 4) return;
-		seen.add(pose.id);
-		var source = vr.trackerBridge.sources.get(pose.id);
-		if (!source) {
-			var node = new BABYLON.TransformNode("steamvr-tracker-" + pose.id, scene);
-			node.rotationQuaternion = BABYLON.Quaternion.Identity();
-			source = {
-				trackerBridgeId: pose.id,
-				grip: node,
-				pointer: node,
-				inputSource: {
-					handedness: "none",
-					targetRayMode: "tracked-pointer",
-					gripSpace: true,
-					hand: null,
-					profiles: ["steamvr-generic-tracker"]
-				}
-			};
-			vr.trackerBridge.sources.set(pose.id, source);
-			registerVrInputSource(source);
-		}
-		var xrCamera = vr.experience && vr.experience.baseExperience.camera;
-		source.grip.parent = xrCamera ? xrCamera.parent : null;
-		var scale = vr.experience ? vr.experience.baseExperience.sessionManager.worldScalingFactor : 1;
-		source.grip.position.set(pose.position[0], pose.position[1], -pose.position[2]).scaleInPlace(scale || 1);
-		// Babylon's left-handed WebXR conversion negates the incoming Z position
-		// and the quaternion Z/W components. Match it so bridge and WebXR poses
-		// occupy exactly the same standing reference space.
-		source.grip.rotationQuaternion.set(
-			pose.orientation[0], pose.orientation[1], -pose.orientation[2], -pose.orientation[3]
-		);
-		source.grip.computeWorldMatrix(true);
-	});
-	Array.from(vr.trackerBridge.sources.keys()).forEach(function (id) {
-		if (!seen.has(id)) removeTrackerBridgeSource(id);
-	});
-	refreshVrStatus();
-}
-
-function scheduleTrackerBridgeReconnect() {
-	if (vr.trackerBridge.retryTimer) return;
-	vr.trackerBridge.retryTimer = setTimeout(function () {
-		vr.trackerBridge.retryTimer = null;
-		connectTrackerBridge();
-	}, 2000);
-}
-
-async function connectTrackerBridge() {
-	var bridge = vr.trackerBridge;
-	if (!window.WebSocket || bridge.socket || bridge.accessPending) return;
-	bridge.accessPending = true;
-	try {
-		var response = await fetch("http://127.0.0.1:17373/health", {
-			mode: "cors",
-			cache: "no-store",
-			targetAddressSpace: "loopback"
-		});
-		if (!response.ok) throw new Error("tracker bridge health check failed");
-	} catch (error) {
-		bridge.accessPending = false;
-		bridge.error = "allow Local Network Access and run the tracker bridge";
-		scheduleTrackerBridgeReconnect();
-		refreshVrStatus();
-		return;
-	}
-	bridge.accessPending = false;
-	if (bridge.socket) return;
-	var socket;
-	try {
-		socket = new WebSocket(TRACKER_BRIDGE_URL);
-	} catch (error) {
-		bridge.error = "SteamVR tracker bridge blocked by the browser";
-		scheduleTrackerBridgeReconnect();
-		return;
-	}
-	bridge.socket = socket;
-	socket.addEventListener("open", function () {
-		bridge.connected = true;
-		bridge.error = "";
-		refreshVrStatus();
-	});
-	socket.addEventListener("message", function (event) {
-		try {
-			updateTrackerBridgePoses(JSON.parse(event.data));
-		} catch (error) {
-			bridge.error = "SteamVR tracker bridge sent invalid pose data";
-		}
-	});
-	socket.addEventListener("close", function () {
-		if (bridge.socket === socket) bridge.socket = null;
-		bridge.connected = false;
-		Array.from(bridge.sources.keys()).forEach(removeTrackerBridgeSource);
-		scheduleTrackerBridgeReconnect();
-		refreshVrStatus();
-	});
-	socket.addEventListener("error", function () {
-		bridge.error = "run scripts/steamvr_tracker_bridge.py on this PC";
-	});
-}
-
 function isSteamVrTrackerCandidate(source) {
 	var inputSource = source && source.inputSource;
 	// Babylon can announce a WebXR input source before its grip/pointer
@@ -1039,22 +914,15 @@ function refreshVrStatus() {
 		text = "unavailable";
 		className = "unavailable";
 	} else if (!vr.active) {
-		text = detectedFeet > 0
-			? "ready - " + detectedFeet + "/2 feet found; enter VR"
-			: "ready - start tracker bridge, then enter VR";
-		className = detectedFeet > 0 ? "ready" : "unavailable";
+		text = "ready - enter VR";
+		className = "ready";
 	} else if (vr.trackingPaused) {
 		text = vr.calibrationError ||
 			("trackers released - " + detectedFeet + "/2 feet found; press trigger to recalibrate");
 		className = vr.calibrationError ? "unavailable" : "ready";
 	} else if (!vr.started) {
-		if (!vr.trackerBridge.connected && detectedFeet < 2) {
-			text = "setup - tracker bridge offline; run scripts/steamvr_tracker_bridge.py";
-			className = "unavailable";
-		} else {
-			text = "setup - " + detectedFeet + "/2 feet found; position yourself, then press trigger";
-			className = "ready";
-		}
+		text = "setup - " + detectedFeet + "/2 feet found; position yourself, then press trigger";
+		className = "ready";
 	} else {
 		var hands = (vr.controllers.left.source ? 1 : 0) + (vr.controllers.right.source ? 1 : 0);
 		text = "active - " + playerName + ", head, hands " + hands + "/2, feet " +
@@ -1536,7 +1404,6 @@ async function boot() {
 	setStageDistance(byId("sceneDistance").value);
 	setFloorOffset(byId("floorOffset").value);
 	setTrackerStiffness(stiffness.value);
-	connectTrackerBridge();
 	await initXR();
 }
 
@@ -1582,9 +1449,6 @@ window.gmDebug = {
 			rightMode: "hand",
 			steamVrTrackersDetected: steamVrTrackerSamples().length,
 			steamVrFeetAttached: attachedFootTrackerCount(),
-			trackerBridgeConnected: vr.trackerBridge.connected,
-			trackerBridgeSources: vr.trackerBridge.sources.size,
-			trackerBridgeError: vr.trackerBridge.error,
 			leftFootAssigned: vr.steamVrTrackers.some(function (registration) {
 				return registration.side === "left";
 			}),

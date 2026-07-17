@@ -5,16 +5,6 @@
       "firebase.json",
       "**/.*",
       "**/node_modules/**"
-    ],
-    "headers": [
-      {
-        "source": "/src/solver-demo.html",
-        "headers": [{ "key": "Cache-Control", "value": "no-cache" }]
-      },
-      {
-        "source": "/src/solver-demo/**",
-        "headers": [{ "key": "Cache-Control", "value": "no-cache" }]
-      }
     ]
   }
 }
