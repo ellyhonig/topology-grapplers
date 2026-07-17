@@ -4,8 +4,8 @@
 export function isFootTrackerInputSource(inputSource) {
 	return !!(inputSource &&
 		inputSource.handedness === "none" &&
-		inputSource.targetRayMode === "tracked-pointer" &&
-		!inputSource.hand);
+		!inputSource.hand &&
+		(inputSource.targetRayMode === "tracked-pointer" || inputSource.gripSpace));
 }
 
 export function chooseFootTrackerPair(samples, headsetPosition, rightAxis) {

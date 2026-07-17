@@ -528,7 +528,25 @@ function controllerNode(source) {
 
 function isSteamVrTrackerCandidate(source) {
 	var inputSource = source && source.inputSource;
-	return isFootTrackerInputSource(inputSource) && !!controllerNode(source);
+	// Babylon can announce a WebXR input source before its grip/pointer
+	// TransformNode has been populated. Register the hardware now and wait for
+	// the node's pose in steamVrTrackerSamples instead of dropping it forever.
+	return isFootTrackerInputSource(inputSource);
+}
+
+function reconcileVrInputSources() {
+	var xrInput = vr.experience && vr.experience.input;
+	var sources = xrInput && xrInput.controllers;
+	if (!sources) return;
+	sources.forEach(function (source) {
+		var side = source.inputSource && source.inputSource.handedness;
+		var knownController = (side === "left" || side === "right") &&
+			vr.controllers[side].source === source;
+		var knownTracker = vr.steamVrTrackers.some(function (registration) {
+			return registration.source === source;
+		});
+		if (!knownController && !knownTracker) registerVrInputSource(source);
+	});
 }
 
 function triggerPressed(source) {
@@ -822,6 +840,9 @@ function restoreDesktopStage() {
 
 function updateVrInput() {
 	if (!vr.active || !vr.experience) return;
+	// Reconcile as well as observing add/remove events. Some SteamVR/Babylon
+	// combinations expose generic tracker sources before our observer is ready.
+	reconcileVrInputSources();
 	var input = pollVrControllerInput();
 	if (!vr.started) {
 		recenterVrMenu(false);
@@ -1152,6 +1173,7 @@ async function initXR() {
 				releaseAllTrackers();
 				setVrTrackerVisualsVisible(vr.player, true);
 				if (vr.menu) vr.menu.plane.setEnabled(true);
+				reconcileVrInputSources();
 				recenterVrMenu(true);
 				// Setup remains untracked so the user can align with the staged
 				// grappler. The first trigger press performs the one-time snap.

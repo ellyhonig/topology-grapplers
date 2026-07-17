@@ -66,11 +66,13 @@ tracking starts, the setup menu and grappler stage recenter together when the
 headset turns more than 30 degrees away. After tracking starts, both stay
 locked in the play space.
 
-SteamVR tracker discovery uses WebXR input sources with handedness `none` and
-target-ray mode `tracked-pointer`. If the status does not reach `2/2 feet
-found`, confirm both trackers are powered, tracked, and exposed to the browser's
-WebXR session. When more than two unhanded tracked devices are exposed, the two
-lowest devices at calibration are used.
+SteamVR tracker discovery uses unhanded WebXR input sources that expose a
+tracked pointer or grip space. Discovery is reconciled while the session is
+running, since some runtimes finish creating a tracker's pose node after first
+announcing the source. If the status does not reach `2/2 feet found`, confirm
+both trackers are powered, tracked, and exposed to the browser's WebXR session.
+When more than two unhanded tracked devices are exposed, the two lowest devices
+at calibration are used.
 
 ## Headset access and port forwarding
 
