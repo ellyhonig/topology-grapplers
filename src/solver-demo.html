@@ -30,12 +30,12 @@
 		<aside class="controls">
 			<header>
 				<h1>Rust XPBD Solver</h1>
-				<p>Each grappler carries five 6-DOF trackers - hands, feet, and head. Mouse gizmos still work, or enter VR to drive either grappler in third person with a headset and two controllers.</p>
+				<p>Each grappler carries five 6-DOF trackers - hands, feet, and head. Mouse gizmos still work, or enter VR to drive either grappler with a headset, two controllers, and two SteamVR foot trackers.</p>
 			</header>
 
 			<section class="vr-card">
 				<h2>VR controls</h2>
-				<p>Enter VR, choose a pose, and position yourself before tracking. The menu and grapplers follow your view during setup. Point away from the menu and press either trigger once to snap on tracking; after releasing it, a trigger hold clutches that controller from the hand to the foot.</p>
+				<p>Connect two trackers in SteamVR, enter VR, choose a pose, and position yourself with one tracker on each foot. Point away from the menu and press either controller trigger once to calibrate and start. The lower unhanded SteamVR devices are assigned left/right from their positions at that moment; controllers remain on the hands.</p>
 				<label class="field">
 					<span>VR-controlled grappler</span>
 					<select id="vrPlayerSelect">
@@ -51,7 +51,7 @@
 					<span>Manual floor height <output id="floorOffsetOut">0 cm</output></span>
 					<input id="floorOffset" type="range" min="-0.75" max="0.75" value="0" step="0.05">
 				</label>
-				<button id="vrStartBtn" type="button" disabled>Start tracking</button>
+				<button id="vrStartBtn" type="button" disabled>Press a trigger in VR to calibrate</button>
 				<p class="hint">Position, player, distance, floor height, stiffness, reset, and tracker-release controls are also available in the floating VR panel. Point at a panel control and press any controller button to activate it.</p>
 			</section>
 

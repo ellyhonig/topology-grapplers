@@ -36,33 +36,41 @@ All three requests should return `200`. The WASM response should use
 
 ## VR controls
 
-1. Open the demo in a WebXR-capable headset browser and choose **Enter VR**.
+1. Connect and track two foot trackers in SteamVR, then open the demo in a
+   WebXR-capable headset browser and choose **Enter VR**.
 2. Choose a starting GrappleMap position and either the red or blue grappler.
    No body trackers are active during setup.
 3. Move and turn your head to position yourself. Whenever the setup panel
    recenters, the grappler stage recenters with it.
 4. Adjust scene distance, manual floor height, or tracker stiffness if needed.
    Point at a panel control and press any controller button to activate it.
-5. Point away from the panel and press either trigger once. This locks the
-   setup placement, snaps the head and both hands to the headset/controllers,
-   and hides the controlled grappler's tracker-box visuals.
-6. Release the starting trigger. After that, hold a controller trigger to
-   clutch that side from the hand to the foot; release it to return to the
-   hand.
+5. Look forward and stand with the tracker on your left foot physically to
+   your left and the tracker on your right foot physically to your right.
+6. Point away from the panel and press either controller trigger once. This
+   locks the setup placement and performs the only start/calibration action.
+   The head and hands attach to the headset/controllers, while the two lowest
+   unhanded 6-DOF WebXR sources are classified left/right along the headset's
+   horizontal axis and assigned to the matching foot gizmos.
 
-At the initial tracking moment, head and hand trackers snap directly onto the
-headset and controllers. A foot clutch instead captures the foot's existing
-position and orientation relative to that controller. Controller translation
-then moves the ankle without controller rotation orbiting it, while rotation
-aims the toe around the pinned ankle and does not pull on the heel/whole leg.
-The solver reads all tracker world poses in stage coordinates.
+At calibration, each foot gizmo preserves its existing position and orientation
+relative to its assigned SteamVR tracker. Tracker translation then moves the
+ankle one-to-one, while tracker rotation changes the calibrated foot orientation
+without orbiting the ankle target. The controllers always drive the hands;
+holding a trigger no longer switches a controller to a foot. The solver reads
+all tracker world poses in stage coordinates.
 
 The floating panel also provides **Floor -5 cm**, **Floor +5 cm**, **Reset
 pose**, and **Release trackers**. Releasing trackers returns to setup; the next
-off-panel trigger press resumes tracking with a fresh one-time snap. Before
+off-panel trigger press detects, assigns, and recalibrates the feet. Before
 tracking starts, the setup menu and grappler stage recenter together when the
 headset turns more than 30 degrees away. After tracking starts, both stay
 locked in the play space.
+
+SteamVR tracker discovery uses WebXR input sources with handedness `none` and
+target-ray mode `tracked-pointer`. If the status does not reach `2/2 feet
+found`, confirm both trackers are powered, tracked, and exposed to the browser's
+WebXR session. When more than two unhanded tracked devices are exposed, the two
+lowest devices at calibration are used.
 
 ## Headset access and port forwarding
 
