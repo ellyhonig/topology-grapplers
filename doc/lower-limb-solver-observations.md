@@ -2,16 +2,143 @@
 
 ## Scope
 
-This note records an observation pass only. It does not propose a code change as
-already decided; it identifies why foot dragging currently feels more like
-pulling a rope than manipulating a leg, and outlines experiments for a later
-implementation pass.
+This note began as an observation pass. It identifies why foot dragging felt
+more like pulling a rope than manipulating a leg and outlines the longer-term
+constraint work. It now also records the first bounded implementation task,
+its proof obligation, measured result, and reproduction steps.
 
 The browser demo was observed with the current WASM build, including a standing
 pose and an engaged foot tracker. The behavior agrees with the Rust solver's
 constraint and input paths. Nothing in the WASM wrapper appears to be dropping
 an anatomical constraint: the wrapper passes effectors directly into the Rust
 solver and returns the resulting particle positions.
+
+## First implementation task: retain tone when a foot tracker engages
+
+**Status: completed.** The first task was deliberately narrower than solving
+the complete lower-limb anatomy model:
+
+> Engaging a stationary ankle/heel/toe tracker must not turn the driven leg
+> into a passive chain or cause it to collapse under gravity.
+
+This is a useful first theorem because a stationary target supplies no intended
+motion. Any large movement after engagement is therefore solver-induced drift,
+not an ambiguous question of how strongly an athlete should resist a drag.
+
+### Change
+
+`solver/crates/gm-solver/src/solver.rs` now uses a lower-limb-specific
+tone-retention gradient. For a driven leg, the retained fractions of normal
+tone are:
+
+| Coordinate | Retained tone |
+|---|---:|
+| directly targeted foot coordinate | 0.00 |
+| untargeted ankle/heel/toe coordinate | 0.10 |
+| knee | 0.40 |
+| hip | 0.70 |
+
+The directly commanded coordinate remains free of a direct restoring pull, so
+the effector still wins locally. Retention increases toward the pelvis, where
+unintended motion is more costly. Arm, neck, core, grip-ownership, and hard
+constraint behavior are unchanged.
+
+Desktop foot orientation normally supplies ankle, heel, and toe effectors at
+once. Each target coordinate is therefore at zero direct tone, while repeated
+orientation effectors leave the knee at `0.40` and the hip at `0.70`; applying
+the same attenuation more than once is idempotent.
+
+### Mathematical proof obligation
+
+For joint `j`, the tone projection first computes the restoring component
+
+`r_j = k s_j (g_j - p_j)`,
+
+where `k` is configured tone stiffness, `s_j` is the retained-tone scale,
+`g_j` is the shape-matching goal, and `p_j` is the current point. The solver
+then subtracts a shared mass-weighted mean correction so tone cannot translate
+the center of mass. That shared correction may move a directly targeted point,
+but it does not change the ordering of the direct restoring coefficients.
+
+For the new leg policy,
+
+`0 = s_target < s_foot = 0.10 < s_knee = 0.40 < s_hip = 0.70 <= 1`.
+
+Consequently, for equal goal error, the magnitudes of the direct restoring
+terms have the ratio `0 : 0.10 : 0.40 : 0.70`. With the default `k = 0.40`,
+the corresponding per-substep coefficients are `0`, `0.04`, `0.16`, and
+`0.28`. Thus the exact target is not directly opposed, while the knee and hip
+provably cannot have the zero restoring coefficient that produced the passive
+chain. Unit tests exhaust the other discrete cases relevant to this change:
+
+- the scale is strictly increasing from target to hip;
+- the opposite leg and other player remain at full scale;
+- ankle/heel/toe orientation effectors cannot cumulatively re-relax the knee
+  or hip; and
+- the existing arm policy is unchanged.
+
+This proves the attenuation policy, not anatomical realism. The latter still
+requires local joint frames and the constraints listed later in this note.
+
+### Behavioral regression result
+
+The deterministic regression pose pins the pelvis (`LeftHip`, `RightHip`, and
+`Core`) to remove whole-body translation, settles for 60 frames, and then holds
+stationary left ankle/heel/toe targets for 60 frames at 60 Hz. The acceptance
+bound is less than 2 cm of ankle drift, knee drift, and tracker residual.
+
+| Release build | Ankle drift after 1 s | Knee drift after 1 s | Result |
+|---|---:|---:|---|
+| old binary leg relaxation | 28.0003 cm | 43.0233 cm | fail |
+| graded `0/0.10/0.40/0.70` policy | 0.3500 cm | 0.4546 cm | pass |
+
+The automated test is
+`stationary_foot_tracker_does_not_collapse_the_driven_leg`. A reusable
+translation sweep is in
+`solver/tests/examples/probe_lower_limb_tone.rs`; it emits CSV for targets from
+0 through 20 cm so later constraint work can be compared against the same
+setup.
+
+### How to verify this yourself
+
+From `topology-grapplers/solver`, run the focused behavioral regression:
+
+```sh
+cargo test --release -p gm-solver \
+  stationary_foot_tracker_does_not_collapse_the_driven_leg
+```
+
+Then verify the exact scale invariants and print the diagnostic sweep:
+
+```sh
+cargo test --release -p gm-solver tone_scale_tests
+cargo run --release -p gm-tests --example probe_lower_limb_tone
+```
+
+In the sweep, the `target_cm=0` row should report about `0.35` cm ankle
+residual/drift and `0.45` cm knee drift, with zero pinned hip/core movement and
+`rejected=false`. Small floating-point variation is acceptable; the automated
+bound is 2 cm. Finally, run every solver, database, fuzz, determinism, and WASM
+test:
+
+```sh
+cargo test --release --workspace
+```
+
+For a visual check, rebuild the browser package and serve the repository:
+
+```sh
+wasm-pack build crates/gm-wasm --target web \
+  --out-dir ../../../src/solver-demo/pkg
+cd ..
+python3 -m http.server 8765
+```
+
+Open `http://localhost:8765/src/solver-demo.html`, engage a foot without first
+moving it, and hold it for one second. The knee/ankle should retain their pose
+instead of going slack. Then drag the foot deliberately. Large translations,
+knee-plane stability, and ankle roll are diagnostic observations for the next
+tasks, not pass criteria for this first intervention.
 
 ## Reported and reproduced symptoms
 
@@ -46,7 +173,8 @@ The leg chain therefore has these protections:
 - a very permissive minimum knee angle;
 - a knee hyperextension guard only near straight;
 - collisions, floor contact, and damping;
-- whole-body shape-matching tone, except when the leg is being driven.
+- whole-body shape-matching tone, with graded foot/knee/hip attenuation while
+  the leg is being driven.
 
 It does **not** have:
 
@@ -60,20 +188,21 @@ It does **not** have:
 
 ## Primary causes
 
-### 1. Driving a foot completely relaxes the leg
+### 1. Driving a foot completely relaxed the leg (first intervention complete)
 
-`gm-solver/src/solver.rs` groups knee, ankle, heel, and toe as one driven limb.
-If an effector targets any member of that group, every joint in the group gets a
-tone scale of `0.0`; the hip retains only `0.3` of normal tone.
+Before the first intervention, `solver/crates/gm-solver/src/solver.rs` grouped
+knee, ankle, heel, and toe as one driven limb. If an effector targeted any
+member of that group, every joint in the group received a tone scale of `0.0`;
+the hip retained only `0.3` of normal tone.
 
-This is the most direct explanation for the missing pose retention. While a foot
-tracker is engaged, the only continuous spring that tries to preserve the
-authored leg shape is intentionally removed from the entire leg. The remaining
-rules mostly enforce validity, not a human-like resistance curve.
+This was the most direct explanation for the missing pose retention. While a
+foot tracker was engaged, the only continuous spring that tried to preserve the
+authored leg shape was intentionally removed from the entire leg. The remaining
+rules mostly enforced validity, not a human-like resistance curve.
 
-This relaxation policy was chosen so tone would not make limb dragging feel
-muddy. It is too binary for a leg: the ankle target should be free to move, but
-the knee and hip should not become passive rope joints at the same instant.
+The completed first intervention replaces that binary lower-limb rule with the
+graded policy proved above. This removes stationary-engagement collapse, but it
+does not yet supply a human-like resistance curve for large motion.
 
 ### 2. The knee guard prevents only one narrow failure mode
 
@@ -126,12 +255,13 @@ static restoring torque. Once a joint has been displaced and velocity reaches
 zero, damping has nothing to say about whether that pose should be held or
 resisted.
 
-### 6. Current validation tests validity, not leg feel
+### 6. Validation mostly tests validity, not leg feel
 
 The existing guarantees emphasize bone length, minimum angles, collisions,
 topology, bounded speed, and deterministic behavior. A leg can satisfy all of
-those checks while exhibiting unrealistic knee-plane motion or ankle roll.
-There is no regression criterion such as "a 5 cm foot displacement must create
+those checks while exhibiting unrealistic knee-plane motion or ankle roll. The
+first intervention adds a stationary-tracker retention criterion, but there is
+still no acceptance criterion such as "a 5 cm foot displacement must create
 measurable knee/hip resistance before full extension."
 
 ## Why the arms can look better
@@ -157,6 +287,11 @@ safety limits. Merely raising global tone or adding one fixed hip cone is likely
 to create new problems.
 
 ### A. Stop relaxing the entire lower limb as one binary unit
+
+The first bounded version of this direction is complete. The implemented
+gradient and its stationary-tracker regression are documented above. Further
+tuning should be based on the translation and rotation probes, not on the
+stationary criterion alone.
 
 Use a graded response when the foot is driven:
 
@@ -222,15 +357,16 @@ A leg should not be either slack or hard-blocked. A useful response curve has:
 This would make pulling a foot toward the head load the ankle, knee, and hip
 before the chain reaches maximum length.
 
-## Suggested diagnostic experiments before implementation
+## Suggested diagnostic experiments for the remaining work
 
 Add measurement probes before tuning constants so improvements can be compared
 objectively:
 
-1. **Foot translation:** Move an ankle target in 2 cm increments toward the
-   head. Record ankle residual, knee displacement, hip displacement, and pelvis
-   displacement. The current model is expected to show a long low-resistance
-   region followed by a sharp increase near full extension.
+1. **Foot translation (initial probe implemented):** Move a foot target in 2 cm
+   increments toward the head. Record ankle residual, knee displacement, hip
+   displacement, and pelvis displacement. The deterministic anchored-pelvis
+   sweep now exists in `probe_lower_limb_tone.rs`; it remains a diagnostic, not
+   an acceptance curve.
 2. **Knee valgus/varus:** Move the ankle medially and laterally with hip position
    held approximately constant. Record knee-plane angle relative to the pelvis.
 3. **Foot roll:** Rotate a foot tracker about its forward axis at fixed ankle
@@ -251,9 +387,11 @@ multiplier contributed by each soft anatomical constraint.
 
 ## Proposed order of attack
 
-1. Build the translation, knee-plane, and foot-roll probes.
-2. Change lower-limb tone relaxation from binary to graded and measure again.
-3. Add a soft knee bend-plane/rest-orientation constraint.
+1. Expand the completed translation probe with knee-plane and foot-roll probes.
+2. **Completed:** change lower-limb tone relaxation from binary to graded and
+   add a stationary-tracker regression.
+3. Add a soft knee bend-plane/rest-orientation constraint, using the new probe
+   as its acceptance test.
 4. Add a soft foot-to-shin orientation constraint and separate foot position
    from orientation compliance.
 5. Add hard ankle, knee, and hip safety envelopes.
@@ -266,10 +404,12 @@ ankle roll and extreme internal rotation robustly.
 ## Bottom line
 
 The current lower limb is anatomically valid only in a coarse positional sense.
-When the foot is driven, its pose-holding mechanism is disabled, and the
-remaining constraints mostly say "keep every bone the right length and do not
-hyperextend through straight." That naturally produces a floppy chain whose
-first strong tension appears at full reach.
+The first intervention keeps graded tone active when the foot is driven and
+prevents a stationary tracker from collapsing the leg. The remaining
+constraints still mostly say "keep every bone the right length and do not
+hyperextend through straight." Without local angular constraints, larger
+motions can still produce a floppy chain whose first strong tension appears at
+full reach.
 
 The solution is not in the WASM boundary. It is to retain graded lower-limb tone,
 model knee/hip/ankle orientation explicitly enough to observe the problematic

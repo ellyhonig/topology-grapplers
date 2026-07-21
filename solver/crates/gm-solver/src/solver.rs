@@ -28,12 +28,10 @@ use crate::config::SolverConfig;
 use crate::effector::Effector;
 use crate::state::SolverState;
 
-/// Joints that move together when a limb is driven: an effector on any joint of
-/// a group relaxes muscle tone across the whole group, so input extends the
-/// limb instead of fighting the held pose joint by joint. Each group's root
-/// (shoulder/hip - structurally torso) only *partially* relaxes: enough that
-/// the torso can turn into an awkward reach, but stiff enough that a drag
-/// extends the limb instead of towing the body.
+/// Joints that move together when a limb is driven. These groups define grip
+/// ownership for every limb, and the binary relaxation policy retained for
+/// arms, neck, and core. Legs use the graded policy in `tone_scales`: a foot
+/// drive must not turn the hip-knee-ankle chain into a passive rope.
 const LIMB_GROUPS: [(&[Joint], Option<Joint>); 6] = [
     (
         &[Joint::LeftElbow, Joint::LeftWrist, Joint::LeftHand, Joint::LeftFingers],
@@ -55,13 +53,42 @@ const LIMB_GROUPS: [(&[Joint], Option<Joint>); 6] = [
     (&[Joint::Core], None),
 ];
 
-/// How relaxed a driven limb's tone is (fraction of normal tone kept). The
-/// limb itself relaxes entirely - otherwise tone pull-back outruns the
-/// effector speed cap and drags feel like mud.
+/// How relaxed a driven arm/neck/core group's tone is (fraction of normal tone
+/// kept). Lower limbs deliberately use the non-binary scales below.
 const DRIVEN_TONE_SCALE: f64 = 0.0;
 
-/// Residual tone on a driven limb's root joint (shoulder/hip).
+/// Residual tone on a driven arm's root joint (shoulder).
 const DRIVEN_ROOT_TONE_SCALE: f64 = 0.3;
+
+/// Tone retained by the untargeted points of a driven foot frame. The exact
+/// effector joint is always relaxed to zero below, so input still wins locally.
+const DRIVEN_FOOT_TONE_SCALE: f64 = 0.1;
+
+/// Tone retained by the knee while any point of its lower limb is driven.
+const DRIVEN_KNEE_TONE_SCALE: f64 = 0.4;
+
+/// Tone retained by the hip while its lower limb is driven. The increasing
+/// foot -> knee -> hip gradient keeps proximal pose retention from dropping to
+/// zero merely because a distal tracker engaged.
+const DRIVEN_HIP_TONE_SCALE: f64 = 0.7;
+
+/// hip, knee, ankle, heel, toe for each lower limb.
+const LEG_GROUPS: [[Joint; 5]; 2] = [
+    [
+        Joint::LeftHip,
+        Joint::LeftKnee,
+        Joint::LeftAnkle,
+        Joint::LeftHeel,
+        Joint::LeftToe,
+    ],
+    [
+        Joint::RightHip,
+        Joint::RightKnee,
+        Joint::RightAnkle,
+        Joint::RightHeel,
+        Joint::RightToe,
+    ],
+];
 
 /// A grip: a hand or hooking foot tethered to another capsule, captured from
 /// the loaded pose. Grappling positions are authored with grips (collar ties,
@@ -300,21 +327,107 @@ fn grip_strainable(grips: &[Grip], caps: &[CapsuleDef], effectors: &[Effector]) 
 fn tone_scales(effectors: &[Effector]) -> [[f64; gm_core::JOINT_COUNT]; gm_core::PLAYER_COUNT] {
     let mut scales = [[1.0f64; gm_core::JOINT_COUNT]; gm_core::PLAYER_COUNT];
     for e in effectors {
-        for (group, root) in LIMB_GROUPS {
-            if group.contains(&e.joint.joint) {
-                for &j in group {
-                    let s = &mut scales[e.joint.player.index()][j.index()];
-                    *s = (*s).min(DRIVEN_TONE_SCALE);
-                }
-                if let Some(root) = root {
-                    let s = &mut scales[e.joint.player.index()][root.index()];
-                    *s = (*s).min(DRIVEN_ROOT_TONE_SCALE);
+        if let Some(leg) = LEG_GROUPS
+            .iter()
+            .find(|leg| leg[1..].contains(&e.joint.joint))
+        {
+            let retained = [
+                DRIVEN_HIP_TONE_SCALE,
+                DRIVEN_KNEE_TONE_SCALE,
+                DRIVEN_FOOT_TONE_SCALE,
+                DRIVEN_FOOT_TONE_SCALE,
+                DRIVEN_FOOT_TONE_SCALE,
+            ];
+            for (&joint, scale) in leg.iter().zip(retained) {
+                let s = &mut scales[e.joint.player.index()][joint.index()];
+                *s = (*s).min(scale);
+            }
+        } else {
+            for (group, root) in LIMB_GROUPS {
+                if group.contains(&e.joint.joint) {
+                    for &j in group {
+                        let s = &mut scales[e.joint.player.index()][j.index()];
+                        *s = (*s).min(DRIVEN_TONE_SCALE);
+                    }
+                    if let Some(root) = root {
+                        let s = &mut scales[e.joint.player.index()][root.index()];
+                        *s = (*s).min(DRIVEN_ROOT_TONE_SCALE);
+                    }
                 }
             }
         }
+        // The directly commanded coordinate gets no direct tone component.
         scales[e.joint.player.index()][e.joint.joint.index()] = 0.0;
     }
     scales
+}
+
+#[cfg(test)]
+mod tone_scale_tests {
+    use super::*;
+    use gm_core::{P0, P1};
+
+    fn effector(player: PlayerId, joint: Joint) -> Effector {
+        Effector {
+            joint: PlayerJoint { player, joint },
+            target: V3::ZERO,
+            stiffness: 1.0,
+        }
+    }
+
+    #[test]
+    fn foot_drive_retains_a_monotone_tone_gradient_toward_the_hip() {
+        let scales = tone_scales(&[effector(P0, Joint::LeftToe)]);
+        let p0 = &scales[P0.index()];
+
+        assert_eq!(p0[Joint::LeftToe.index()], 0.0);
+        assert_eq!(p0[Joint::LeftHeel.index()], DRIVEN_FOOT_TONE_SCALE);
+        assert_eq!(p0[Joint::LeftAnkle.index()], DRIVEN_FOOT_TONE_SCALE);
+        assert_eq!(p0[Joint::LeftKnee.index()], DRIVEN_KNEE_TONE_SCALE);
+        assert_eq!(p0[Joint::LeftHip.index()], DRIVEN_HIP_TONE_SCALE);
+        assert!(
+            p0[Joint::LeftToe.index()] < p0[Joint::LeftAnkle.index()]
+                && p0[Joint::LeftAnkle.index()] < p0[Joint::LeftKnee.index()]
+                && p0[Joint::LeftKnee.index()] < p0[Joint::LeftHip.index()]
+        );
+
+        // The policy is local to the driven leg and player.
+        assert_eq!(p0[Joint::RightKnee.index()], 1.0);
+        assert_eq!(p0[Joint::Core.index()], 1.0);
+        assert_eq!(scales[P1.index()][Joint::LeftKnee.index()], 1.0);
+    }
+
+    #[test]
+    fn foot_orientation_effectors_do_not_re_relax_the_knee_or_hip() {
+        let scales = tone_scales(&[
+            effector(P0, Joint::LeftAnkle),
+            effector(P0, Joint::LeftHeel),
+            effector(P0, Joint::LeftToe),
+        ]);
+        let p0 = &scales[P0.index()];
+
+        assert_eq!(p0[Joint::LeftAnkle.index()], 0.0);
+        assert_eq!(p0[Joint::LeftHeel.index()], 0.0);
+        assert_eq!(p0[Joint::LeftToe.index()], 0.0);
+        assert_eq!(p0[Joint::LeftKnee.index()], DRIVEN_KNEE_TONE_SCALE);
+        assert_eq!(p0[Joint::LeftHip.index()], DRIVEN_HIP_TONE_SCALE);
+    }
+
+    #[test]
+    fn arm_relaxation_policy_is_unchanged() {
+        let scales = tone_scales(&[effector(P0, Joint::RightHand)]);
+        let p0 = &scales[P0.index()];
+
+        for joint in [
+            Joint::RightElbow,
+            Joint::RightWrist,
+            Joint::RightHand,
+            Joint::RightFingers,
+        ] {
+            assert_eq!(p0[joint.index()], DRIVEN_TONE_SCALE);
+        }
+        assert_eq!(p0[Joint::RightShoulder.index()], DRIVEN_ROOT_TONE_SCALE);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

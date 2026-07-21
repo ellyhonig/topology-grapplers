@@ -136,6 +136,56 @@ mod tests {
     }
 
     #[test]
+    fn stationary_foot_tracker_does_not_collapse_the_driven_leg() {
+        let pose = standing_pose();
+        let mut solver = Solver::new(&pose, SolverConfig::default());
+        // Isolate lower-limb deformation from whole-body translation and the
+        // standing balance controller's recovery strategy.
+        solver.set_pins(vec![
+            PlayerJoint { player: P0, joint: LeftHip },
+            PlayerJoint { player: P0, joint: RightHip },
+            PlayerJoint { player: P0, joint: Core },
+        ]);
+        let mut state = SolverState::from_pose(pose);
+        for _ in 0..60 {
+            state = solver.step(&state, &[], 1.0 / 60.0).0;
+        }
+        let reference = state.pose;
+        let effectors = [LeftAnkle, LeftHeel, LeftToe].map(|joint| Effector {
+            joint: PlayerJoint { player: P0, joint },
+            target: reference.get(P0, joint),
+            stiffness: 0.9,
+        });
+
+        let mut max_residual = 0.0f64;
+        for _ in 0..60 {
+            let (next, diag) = solver.step(&state, &effectors, 1.0 / 60.0);
+            assert!(!diag.rejected);
+            max_residual = diag
+                .effector_residuals
+                .iter()
+                .copied()
+                .fold(max_residual, f64::max);
+            state = next;
+        }
+
+        let ankle_drift = state.pose.get(P0, LeftAnkle).distance(reference.get(P0, LeftAnkle));
+        let knee_drift = state.pose.get(P0, LeftKnee).distance(reference.get(P0, LeftKnee));
+        assert!(
+            ankle_drift < 0.02,
+            "stationary foot tracker let ankle drift {ankle_drift} m"
+        );
+        assert!(
+            knee_drift < 0.02,
+            "stationary foot tracker let knee drift {knee_drift} m"
+        );
+        assert!(
+            max_residual < 0.02,
+            "stationary foot tracker accumulated {max_residual} m residual"
+        );
+    }
+
+    #[test]
     fn effector_moves_hand_without_breaking_bones() {
         let pose = standing_pose();
         let solver = Solver::new(&pose, SolverConfig::default());
