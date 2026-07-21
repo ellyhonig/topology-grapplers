@@ -7,6 +7,7 @@
 //! entanglement by tunneling.
 
 pub mod anatomy_constraints;
+pub mod ankle_constraints;
 pub mod config;
 pub mod effector;
 pub mod solver;
@@ -21,7 +22,10 @@ pub use state::SolverState;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gm_core::{v3, Joint::*, PlayerJoint, Pose, P0, P1};
+    use crate::ankle_constraints::{
+        ankle_angles, ankle_axial_swing, capture_ankle_reference, LegSide,
+    };
+    use gm_core::{v3, Joint::*, PlayerJoint, Pose, V3, P0, P1};
 
     /// Two humans standing ~upright, one meter apart, with nominal limb lengths.
     fn standing_pose() -> Pose {
@@ -231,5 +235,190 @@ mod tests {
             let p = state.pose[pj];
             assert!(p.y >= 0.0 && p.x.abs() <= 2.0 + 1e-9 && p.z.abs() <= 2.0 + 1e-9);
         }
+    }
+
+    fn rotate_about_axis(point: V3, origin: V3, axis: V3, radians: f64) -> V3 {
+        let axis = axis.normalized_or_zero();
+        let relative = point - origin;
+        let (sin, cos) = radians.sin_cos();
+        origin
+            + relative * cos
+            + axis.cross(relative) * sin
+            + axis * (axis.dot(relative) * (1.0 - cos))
+    }
+
+    fn run_continuous_planted_foot_orbit(pin_knee: bool) {
+        let pose = standing_pose();
+        let reference = capture_ankle_reference(&pose, P0, LegSide::Left);
+        let config = SolverConfig {
+            gravity: 0.0,
+            balance_stiffness: 0.0,
+            friction: 0.0,
+            floor_friction: 0.0,
+            ..SolverConfig::default()
+        };
+        let limit = config.ankle_swing_limit;
+        assert!(limit < std::f64::consts::PI - 0.5);
+        let mut solver = Solver::new(&pose, config);
+        let mut pins = vec![
+            PlayerJoint { player: P0, joint: LeftHip },
+            PlayerJoint { player: P0, joint: RightHip },
+            PlayerJoint { player: P0, joint: Core },
+            PlayerJoint { player: P0, joint: LeftAnkle },
+        ];
+        if pin_knee {
+            pins.push(PlayerJoint { player: P0, joint: LeftKnee });
+        }
+        solver.set_pins(pins.clone());
+        let mut state = SolverState::from_pose(pose);
+        let ankle = pose.get(P0, LeftAnkle);
+        let axis = V3::Y;
+        let mut previous_principal = 0.0f64;
+        let mut unwrapped = 0.0f64;
+        let mut interior_residual = 0.0f64;
+        let mut saturated_residual = 0.0f64;
+        let mut saturated_state = None;
+
+        // Successive targets matter: a static 360-degree target is identical
+        // to neutral and cannot prove that a solver blocked the intervening orbit.
+        for command_deg in (0..=360).step_by(5) {
+            let command = (command_deg as f64).to_radians();
+            let target = |joint| rotate_about_axis(pose.get(P0, joint), ankle, axis, command);
+            let effectors = [
+                Effector {
+                    joint: PlayerJoint { player: P0, joint: LeftAnkle },
+                    target: ankle,
+                    stiffness: 1.0,
+                },
+                Effector {
+                    joint: PlayerJoint { player: P0, joint: LeftHeel },
+                    target: target(LeftHeel),
+                    stiffness: 1.0,
+                },
+                Effector {
+                    joint: PlayerJoint { player: P0, joint: LeftToe },
+                    target: target(LeftToe),
+                    stiffness: 1.0,
+                },
+            ];
+            let mut last_diag = None;
+            for _ in 0..3 {
+                let (next, diag) = solver.step(&state, &effectors, 1.0 / 60.0);
+                assert!(!diag.rejected);
+                assert!(
+                    diag.max_bone_error < 0.01,
+                    "command {command_deg}: bone error {}",
+                    diag.max_bone_error,
+                );
+                state = next;
+                last_diag = Some(diag);
+            }
+            assert!(state.pose.is_finite());
+            for pin in &pins {
+                assert!(state.pose[*pin].distance(pose[*pin]) < 1e-12);
+            }
+
+            let angles = ankle_angles(&state.pose, P0, LegSide::Left, &reference).unwrap();
+            assert!(
+                angles.swing <= limit + 2e-3,
+                "command {command_deg}: swing {} exceeded {}",
+                angles.swing.to_degrees(),
+                limit.to_degrees(),
+            );
+            assert!(angles.twist.abs() <= config.ankle_twist_limit + 2e-3);
+
+            let axial = ankle_axial_swing(&state.pose, P0, LegSide::Left, &reference)
+                .expect("the planted foot direction must not align with the shin");
+            let principal = angles.swing.copysign(axial);
+            let delta = (principal - previous_principal)
+                .sin()
+                .atan2((principal - previous_principal).cos());
+            unwrapped += delta;
+            previous_principal = principal;
+            assert!(
+                unwrapped.abs() <= limit + 0.03,
+                "continuous orbit crossed the hard boundary at command {command_deg}: {} deg",
+                unwrapped.to_degrees(),
+            );
+
+            let max_residual = last_diag
+                .unwrap()
+                .effector_residuals
+                .into_iter()
+                .fold(0.0, f64::max);
+            if command_deg == 20 {
+                interior_residual = max_residual;
+            }
+            if command_deg == 160 {
+                // Hold the saturated demand for one second before release, as
+                // a controller would be held against the anatomical stop.
+                let mut held_diag = None;
+                for _ in 0..60 {
+                    let (next, diag) = solver.step(&state, &effectors, 1.0 / 60.0);
+                    assert!(!diag.rejected);
+                    state = next;
+                    held_diag = Some(diag);
+                }
+                saturated_residual = held_diag
+                    .unwrap()
+                    .effector_residuals
+                    .into_iter()
+                    .fold(0.0, f64::max);
+                saturated_state = Some(state);
+            }
+        }
+        assert!(
+            saturated_residual > interior_residual + 0.05,
+            "load did not build after saturation: interior={interior_residual}, saturated={saturated_residual}",
+        );
+
+        // Releasing a saturated target must relax through bounded finite
+        // motion, not convert accumulated residual into a positional snap.
+        let mut released = saturated_state.expect("the sweep includes 160 degrees");
+        for release_frame in 0..120 {
+            let before = released.pose;
+            let before_angles = ankle_angles(&before, P0, LegSide::Left, &reference).unwrap();
+            let (fast_joint, fast_speed) = PlayerJoint::all()
+                .map(|joint| (joint, released.velocity[joint.player.index()][joint.joint.index()].length()))
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap();
+            let (next, diag) = solver.step(&released, &[], 1.0 / 60.0);
+            assert!(!diag.rejected);
+            assert!(next.pose.is_finite());
+            let frame_motion = next.pose.max_displacement(&before);
+            let moved_joint = PlayerJoint::all()
+                .max_by(|a, b| {
+                    next.pose[*a]
+                        .distance(before[*a])
+                        .total_cmp(&next.pose[*b].distance(before[*b]))
+                })
+                .unwrap();
+            assert!(
+                frame_motion < 0.05,
+                "release frame {release_frame} moved {frame_motion} m at {moved_joint:?} from swing={} twist={}, fastest={fast_joint:?} at {fast_speed} m/s",
+                before_angles.swing.to_degrees(),
+                before_angles.twist.to_degrees(),
+            );
+            assert!(next
+                .velocity
+                .iter()
+                .flatten()
+                .all(|velocity| velocity.is_finite()
+                    && velocity.length() <= config.max_joint_speed + 1e-9));
+            let angles = ankle_angles(&next.pose, P0, LegSide::Left, &reference).unwrap();
+            assert!(angles.swing <= limit + 2e-3);
+            assert!(angles.twist.abs() <= config.ankle_twist_limit + 2e-3);
+            released = next;
+        }
+    }
+
+    #[test]
+    fn continuous_foot_orbit_is_blocked_with_fixed_shin_reference() {
+        run_continuous_planted_foot_orbit(true);
+    }
+
+    #[test]
+    fn continuous_foot_orbit_is_blocked_with_solver_controlled_knee() {
+        run_continuous_planted_foot_orbit(false);
     }
 }

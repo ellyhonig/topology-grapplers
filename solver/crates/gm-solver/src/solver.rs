@@ -8,21 +8,29 @@
 //!   3. bone distance constraints (hard)
 //!   4. hinge minimum angles (hard)
 //!   5. hyperextension guards (hard, hysteresis-based)
-//!   6. swing cones (hard)
-//!   7. capsule contacts with ratchet floors + friction (hard)
-//!   8. floor and arena bounds (hard)
+//!   6. rest-relative ankle orientation (soft) + swing/twist envelope (hard)
+//!   7. swing cones (hard)
+//!   8. capsule contacts with ratchet floors + friction (hard)
+//!   9. floor and arena bounds (hard)
 //!
-//! After the whole step, a topology watchdog checks for segment crossings and
-//! writhe jumps; a dirty step is re-solved from the entry state with doubled
-//! substeps, and if it still crosses, the step is rejected (state unchanged).
+//! After the whole step, a safety watchdog checks positional and anatomical
+//! bounds, transition speed, segment crossings, and writhe jumps. A dirty step
+//! is re-solved from the entry state with doubled substeps; if it remains dirty
+//! at the retry limit, the step is rejected (state unchanged).
 
-use gm_collision::{capsules, collidable_pairs, find_contacts, segments_crossed, CapsuleDef, Contact};
-use gm_core::{capture_bones, v3, Bone, Joint, PlayerId, PlayerJoint, Pose, V3};
+use gm_collision::{
+    capsules, collidable_pairs, find_contacts, segments_crossed, CapsuleDef, Contact,
+};
+use gm_core::{capture_bones, v3, Bone, Joint, PlayerId, PlayerJoint, Pose, SWING_CONES, V3};
 use serde::Serialize;
 
 use crate::anatomy_constraints::{
     max_hinge_violation, project_hinge_min_angles, project_hyperextension_guards,
     project_swing_cones, refresh_bend_memory,
+};
+use crate::ankle_constraints::{
+    ankle_angles, capture_ankle_references, project_hard_ankle_envelopes,
+    project_soft_ankle_orientations, AnkleReferences, LegSide,
 };
 use crate::config::SolverConfig;
 use crate::effector::Effector;
@@ -34,19 +42,39 @@ use crate::state::SolverState;
 /// drive must not turn the hip-knee-ankle chain into a passive rope.
 const LIMB_GROUPS: [(&[Joint], Option<Joint>); 6] = [
     (
-        &[Joint::LeftElbow, Joint::LeftWrist, Joint::LeftHand, Joint::LeftFingers],
+        &[
+            Joint::LeftElbow,
+            Joint::LeftWrist,
+            Joint::LeftHand,
+            Joint::LeftFingers,
+        ],
         Some(Joint::LeftShoulder),
     ),
     (
-        &[Joint::RightElbow, Joint::RightWrist, Joint::RightHand, Joint::RightFingers],
+        &[
+            Joint::RightElbow,
+            Joint::RightWrist,
+            Joint::RightHand,
+            Joint::RightFingers,
+        ],
         Some(Joint::RightShoulder),
     ),
     (
-        &[Joint::LeftKnee, Joint::LeftAnkle, Joint::LeftHeel, Joint::LeftToe],
+        &[
+            Joint::LeftKnee,
+            Joint::LeftAnkle,
+            Joint::LeftHeel,
+            Joint::LeftToe,
+        ],
         Some(Joint::LeftHip),
     ),
     (
-        &[Joint::RightKnee, Joint::RightAnkle, Joint::RightHeel, Joint::RightToe],
+        &[
+            Joint::RightKnee,
+            Joint::RightAnkle,
+            Joint::RightHeel,
+            Joint::RightToe,
+        ],
         Some(Joint::RightHip),
     ),
     (&[Joint::Neck, Joint::Head], None),
@@ -71,6 +99,18 @@ const DRIVEN_KNEE_TONE_SCALE: f64 = 0.4;
 /// foot -> knee -> hip gradient keeps proximal pose retention from dropping to
 /// zero merely because a distal tracker engaged.
 const DRIVEN_HIP_TONE_SCALE: f64 = 0.7;
+
+/// Physical admissibility widths shared with validation.  These are not
+/// numerical fudge factors: the collision model treats the joint/capsule radii
+/// as uncompressed surfaces, while the rendered mat and flesh are compliant.
+const MAT_COMPRESSION_ALLOWANCE: f64 = 0.004;
+const FLESH_COMPRESSION_ALLOWANCE: f64 = 0.012;
+const BONE_RELATIVE_ALLOWANCE: f64 = 0.03;
+const BONE_ABSOLUTE_ALLOWANCE: f64 = 0.004;
+const HINGE_ANGLE_ALLOWANCE: f64 = 0.02;
+const SWING_CONE_ALLOWANCE: f64 = 0.02;
+const ANKLE_ANGLE_ALLOWANCE: f64 = 0.002;
+const MAX_ACCEPTED_STEP_SPEED: f64 = 20.0;
 
 /// hip, knee, ankle, heel, toe for each lower limb.
 const LEG_GROUPS: [[Joint; 5]; 2] = [
@@ -164,7 +204,6 @@ const GRIP_RELEASE_LIMIT: f64 = 0.25;
 /// instead of breaking.
 const GRIP_FAIL_LATCH: f64 = 0.02;
 
-
 /// Can `joint` grip capsule `cap`? Opponent capsules always (that's what
 /// grappling is); own capsules only for a hand clasping the *other* arm
 /// (gable grips and the like). Everything else - a hand hanging by the own
@@ -174,12 +213,18 @@ fn can_grip(joint: PlayerJoint, cap: &CapsuleDef) -> bool {
         return true;
     }
     let other_arm: &[Joint] = match joint.joint {
-        Joint::LeftHand | Joint::LeftFingers => {
-            &[Joint::RightElbow, Joint::RightWrist, Joint::RightHand, Joint::RightFingers]
-        }
-        Joint::RightHand | Joint::RightFingers => {
-            &[Joint::LeftElbow, Joint::LeftWrist, Joint::LeftHand, Joint::LeftFingers]
-        }
+        Joint::LeftHand | Joint::LeftFingers => &[
+            Joint::RightElbow,
+            Joint::RightWrist,
+            Joint::RightHand,
+            Joint::RightFingers,
+        ],
+        Joint::RightHand | Joint::RightFingers => &[
+            Joint::LeftElbow,
+            Joint::LeftWrist,
+            Joint::LeftHand,
+            Joint::LeftFingers,
+        ],
         _ => return false,
     };
     cap.ends.iter().all(|e| other_arm.contains(e))
@@ -263,8 +308,14 @@ fn standing_support(pose: &Pose, contact: &Pose, player: PlayerId) -> Option<(V3
             contact[pj].y <= j.radius() + 0.01
         });
         if grounded {
-            let toe = pose[PlayerJoint { player, joint: foot[0] }];
-            let heel = pose[PlayerJoint { player, joint: foot[1] }];
+            let toe = pose[PlayerJoint {
+                player,
+                joint: foot[0],
+            }];
+            let heel = pose[PlayerJoint {
+                player,
+                joint: foot[1],
+            }];
             center += v3(0.5 * (toe.x + heel.x), 0.0, 0.5 * (toe.z + heel.z));
             planted += 1.0;
         }
@@ -360,6 +411,66 @@ fn tone_scales(effectors: &[Effector]) -> [[f64; gm_core::JOINT_COUNT]; gm_core:
         scales[e.joint.player.index()][e.joint.joint.index()] = 0.0;
     }
     scales
+}
+
+/// Keep release of a displaced foot gradual. Once orientation effectors are
+/// removed, restoring full global foot tone in one frame would convert their
+/// accumulated residual into a snap. While either local ankle coordinate is
+/// outside the orientation dead zone, retain the driven knee/hip gradient and
+/// keep the three orientation coordinates free of direct global tone; the
+/// dedicated soft angular rule then unloads the foot progressively. Normal
+/// foot tone resumes only inside the neutral zone.
+fn retain_displaced_ankle_tone(
+    pose: &Pose,
+    references: &AnkleReferences,
+    release_active: &[[bool; 2]; gm_core::PLAYER_COUNT],
+    dead_zone: f64,
+    scales: &mut [[f64; gm_core::JOINT_COUNT]; gm_core::PLAYER_COUNT],
+) {
+    for player in PlayerId::ALL {
+        for (leg_index, side) in LegSide::ALL.into_iter().enumerate() {
+            if !release_active[player.index()][leg_index] {
+                continue;
+            }
+            let Some(angles) =
+                ankle_angles(pose, player, side, &references[player.index()][leg_index])
+            else {
+                continue;
+            };
+            let displacement = angles.swing.max(angles.twist.abs());
+            if displacement <= f64::EPSILON {
+                continue;
+            }
+            // At and outside the angular dead-zone boundary the distal frame
+            // has zero direct global tone. Inside it, tone ramps continuously
+            // back to one as the foot reaches neutral; this avoids a second
+            // snap precisely when the soft angular rule becomes inactive.
+            let release = gm_core::clamp(displacement / dead_zone.max(1e-9), 0.0, 1.0);
+            let retained = [
+                1.0 - release * (1.0 - DRIVEN_HIP_TONE_SCALE),
+                1.0 - release * (1.0 - DRIVEN_KNEE_TONE_SCALE),
+                1.0 - release,
+                1.0 - release,
+                1.0 - release,
+            ];
+            for (&joint, scale) in LEG_GROUPS[leg_index].iter().zip(retained) {
+                let value = &mut scales[player.index()][joint.index()];
+                *value = (*value).min(scale);
+            }
+        }
+    }
+}
+
+fn driven_ankles(effectors: &[Effector]) -> [[bool; 2]; gm_core::PLAYER_COUNT] {
+    let mut driven = [[false; 2]; gm_core::PLAYER_COUNT];
+    for effector in effectors {
+        for (leg_index, leg) in LEG_GROUPS.iter().enumerate() {
+            if leg[2..].contains(&effector.joint.joint) {
+                driven[effector.joint.player.index()][leg_index] = true;
+            }
+        }
+    }
+    driven
 }
 
 #[cfg(test)]
@@ -470,6 +581,9 @@ pub struct Solver {
     /// Grips captured from the loaded pose (hands/feet in tight contact hold
     /// on). Tether constraints: they resist separation, never compression.
     grips: Vec<Grip>,
+    /// Authored foot orientation in each shin-local frame, plus deterministic
+    /// near-straight frame fallbacks.
+    ankle_references: AnkleReferences,
 }
 
 impl Solver {
@@ -502,6 +616,7 @@ impl Solver {
             })
         });
         let grips = capture_grips(pose, &caps);
+        let ankle_references = capture_ankle_references(pose);
         Solver {
             config,
             bones: capture_bones(pose),
@@ -511,6 +626,7 @@ impl Solver {
             pins: Vec::new(),
             balance_ref,
             grips,
+            ankle_references,
         }
     }
 
@@ -582,7 +698,11 @@ impl Solver {
             diag.max_writhe_jump = linking.max_writhe_jump;
             diag.retries = retries;
 
-            let dirty = crossed || linking.max_writhe_jump > gm_topology::WRITHE_JUMP_THRESHOLD;
+            let dirty = self.violates_universal_positional_bounds(&next.pose)
+                || self.violates_anatomical_bounds(&next.pose)
+                || next.pose.max_displacement(&state.pose) > MAX_ACCEPTED_STEP_SPEED * dt
+                || crossed
+                || linking.max_writhe_jump > gm_topology::WRITHE_JUMP_THRESHOLD;
             if !dirty {
                 return (next, diag);
             }
@@ -604,15 +724,137 @@ impl Solver {
     }
 
     fn any_crossing(&self, before: &Pose, after: &Pose) -> bool {
-        self.pairs.iter().enumerate().any(|(pair_idx, &(i, j))| {
-            // Pairs authored in deep contact are legitimately interpenetrated;
-            // orientation flips there are sliding, not tunneling.
-            let (ra, rb) = (self.caps[i].radius, self.caps[j].radius);
-            if self.clearance_floors[pair_idx] < -0.25 * (ra + rb) {
-                return false;
-            }
+        self.pairs.iter().any(|&(i, j)| {
             segments_crossed(before, after, &self.caps, i, j, self.config.contact_margin)
         })
+    }
+
+    /// Exact postcondition used by the step watchdog.  Starting from an
+    /// admissible state, returning the entry state on failure proves that no
+    /// accepted step can cross a floor, arena, or capsule-compression bound,
+    /// even when the requested constraints are mutually infeasible.
+    fn violates_universal_positional_bounds(&self, pose: &Pose) -> bool {
+        const EPSILON: f64 = 1e-9;
+        let extent = self.config.arena_half_extent;
+        if PlayerJoint::all().any(|pj| {
+            let point = pose[pj];
+            !point.is_finite()
+                || point.y < pj.joint.radius() - MAT_COMPRESSION_ALLOWANCE
+                || point.x.abs() > extent + EPSILON
+                || point.z.abs() > extent + EPSILON
+        }) {
+            return true;
+        }
+
+        self.pairs.iter().enumerate().any(|(pair_index, &(i, j))| {
+            let a = &self.caps[i];
+            let b = &self.caps[j];
+            let (ca, cb, _, _) =
+                gm_core::closest_segment_points(pose[a.a()], pose[a.b()], pose[b.a()], pose[b.b()]);
+            let clearance = ca.distance(cb) - a.radius - b.radius;
+            clearance + FLESH_COMPRESSION_ALLOWANCE < self.clearance_floors[pair_index]
+        })
+    }
+
+    /// Anatomical postconditions paired with the universal watchdog above.
+    /// These allowances are the explicit material/numerical widths used by the
+    /// solver contract.  A failed candidate is never partially committed: the
+    /// retry loop either finds an admissible projection or returns the prior
+    /// admissible state, making the invariant inductive over accepted steps.
+    fn violates_anatomical_bounds(&self, pose: &Pose) -> bool {
+        if self.bones.iter().any(|bone| {
+            let error = pose[bone.a()].distance(pose[bone.b()]) - bone.length;
+            error.abs() > BONE_ABSOLUTE_ALLOWANCE
+                && error.abs() / bone.length.max(1e-9) > BONE_RELATIVE_ALLOWANCE
+        }) || max_hinge_violation(pose) > HINGE_ANGLE_ALLOWANCE
+        {
+            return true;
+        }
+
+        if PlayerId::ALL.into_iter().any(|player| {
+            SWING_CONES.iter().any(|cone| {
+                gm_core::anatomy::cone_angle(pose, player, cone)
+                    > cone.half_angle + SWING_CONE_ALLOWANCE
+            })
+        }) {
+            return true;
+        }
+
+        let max_limit = std::f64::consts::PI - 1e-6;
+        let swing_limit = self.config.ankle_swing_limit.clamp(0.0, max_limit);
+        let twist_limit = self.config.ankle_twist_limit.clamp(0.0, max_limit);
+        PlayerId::ALL.into_iter().any(|player| {
+            LegSide::ALL
+                .into_iter()
+                .enumerate()
+                .any(|(side_index, side)| {
+                    ankle_angles(
+                        pose,
+                        player,
+                        side,
+                        &self.ankle_references[player.index()][side_index],
+                    )
+                    .map(|angles| {
+                        angles.swing > swing_limit + ANKLE_ANGLE_ALLOWANCE
+                            || angles.twist.abs() > twist_limit + ANKLE_ANGLE_ALLOWANCE
+                    })
+                    .unwrap_or(true)
+                })
+        })
+    }
+
+    /// A hard ankle correction is admissible only when it preserves every
+    /// higher-priority positional invariant.  For an already-valid floor,
+    /// arena, or capsule constraint this means remaining valid; for an
+    /// inherited violation it means never making the violation deeper.
+    ///
+    /// Written as a scalar inequality, each post-projection margin `m1` must
+    /// satisfy `m1 >= min(m0, 0)`, where `m0` is its pre-projection margin.
+    /// Thus accepting a correction is monotone in every universal validity
+    /// margin.  Rejecting restores the bit-identical input pose.
+    fn ankle_projection_preserves_validity(&self, before: &Pose, after: &Pose) -> bool {
+        const EPSILON: f64 = 1e-9;
+        let extent = self.config.arena_half_extent;
+
+        for pj in PlayerJoint::all() {
+            let floor_before = before[pj].y - pj.joint.radius() + MAT_COMPRESSION_ALLOWANCE;
+            let floor_after = after[pj].y - pj.joint.radius() + MAT_COMPRESSION_ALLOWANCE;
+            if floor_after + EPSILON < floor_before.min(0.0) {
+                return false;
+            }
+
+            for (before_axis, after_axis) in
+                [(before[pj].x, after[pj].x), (before[pj].z, after[pj].z)]
+            {
+                let arena_before = extent - before_axis.abs();
+                let arena_after = extent - after_axis.abs();
+                if arena_after + EPSILON < arena_before.min(0.0) {
+                    return false;
+                }
+            }
+        }
+
+        for (pair_index, &(i, j)) in self.pairs.iter().enumerate() {
+            let a = &self.caps[i];
+            let b = &self.caps[j];
+            let clearance = |pose: &Pose| {
+                let (ca, cb, _, _) = gm_core::closest_segment_points(
+                    pose[a.a()],
+                    pose[a.b()],
+                    pose[b.a()],
+                    pose[b.b()],
+                );
+                ca.distance(cb) - a.radius - b.radius
+            };
+            let before_margin =
+                clearance(before) - self.clearance_floors[pair_index] + FLESH_COMPRESSION_ALLOWANCE;
+            let after_margin =
+                clearance(after) - self.clearance_floors[pair_index] + FLESH_COMPRESSION_ALLOWANCE;
+            if after_margin + EPSILON < before_margin.min(0.0) {
+                return false;
+            }
+        }
+        true
     }
 
     fn solve_pass(
@@ -626,6 +868,7 @@ impl Solver {
         let dt_s = dt / substeps as f64;
         let inv_mass = |pj: PlayerJoint| self.inv_mass(pj);
         let tone_scale = tone_scales(effectors);
+        let ankle_driven = driven_ankles(effectors);
         let mut grip_active = grip_mask(&self.grips, effectors, st.broken_grips);
         let grip_strainable = grip_strainable(&self.grips, &self.caps, effectors);
 
@@ -662,11 +905,49 @@ impl Solver {
             //    gravity and keeps drags local. Weaker than effectors, so input
             //    wins where it acts; plastic adaptation (below) makes sustained
             //    input become the new held pose.
+            for player in PlayerId::ALL {
+                for (leg_index, side) in LegSide::ALL.into_iter().enumerate() {
+                    if ankle_driven[player.index()][leg_index] {
+                        st.ankle_release_active[player.index()][leg_index] = true;
+                    } else if st.ankle_release_active[player.index()][leg_index] {
+                        let settled = ankle_angles(
+                            &st.pose,
+                            player,
+                            side,
+                            &self.ankle_references[player.index()][leg_index],
+                        )
+                        .map(|angles| angles.swing.max(angles.twist.abs()) <= 1.0f64.to_radians())
+                        .unwrap_or(false);
+                        if settled {
+                            st.ankle_release_active[player.index()][leg_index] = false;
+                        }
+                    }
+                }
+            }
+            let mut substep_tone_scale = tone_scale;
+            retain_displaced_ankle_tone(
+                &st.pose,
+                &self.ankle_references,
+                &st.ankle_release_active,
+                self.config.ankle_orientation_deadzone,
+                &mut substep_tone_scale,
+            );
             crate::tone::project_muscle_tone(
                 &mut st.pose,
                 &st.tone_rest,
                 self.config.tone_stiffness,
-                &tone_scale,
+                &substep_tone_scale,
+                &inv_mass,
+            );
+
+            // -- Rest-relative ankle tone is orientation-only: it rotates heel
+            //    and toe rigidly about the ankle, leaving foot position input
+            //    independent. A separate hard envelope below always wins.
+            project_soft_ankle_orientations(
+                &mut st.pose,
+                &self.ankle_references,
+                self.config.ankle_orientation_deadzone,
+                self.config.ankle_orientation_stiffness,
                 &inv_mass,
             );
 
@@ -725,11 +1006,14 @@ impl Solver {
                 }
             }
 
-
             // -- Contacts are gathered once per substep (speculative margin),
             //    with ratchet floors taken from the substep entry pose.
-            let contacts =
-                find_contacts(&entry_pose, &self.caps, &self.pairs, self.config.contact_margin);
+            let contacts = find_contacts(
+                &entry_pose,
+                &self.caps,
+                &self.pairs,
+                self.config.contact_margin,
+            );
 
             // -- Constraint iterations.
             for _ in 0..self.config.iterations {
@@ -737,6 +1021,19 @@ impl Solver {
                 self.project_grips(&mut st.pose, &grip_active, &st.grip_release, &inv_mass);
                 project_hinge_min_angles(&mut st.pose, &inv_mass);
                 project_hyperextension_guards(&mut st, &inv_mass);
+                let before_ankle_projection = st.pose;
+                project_hard_ankle_envelopes(
+                    &mut st.pose,
+                    &self.ankle_references,
+                    self.config.ankle_swing_limit,
+                    self.config.ankle_twist_limit,
+                    &inv_mass,
+                );
+                if st.pose != before_ankle_projection
+                    && !self.ankle_projection_preserves_validity(&before_ankle_projection, &st.pose)
+                {
+                    st.pose = before_ankle_projection;
+                }
                 project_swing_cones(&mut st.pose, &inv_mass);
                 self.project_contacts(&mut st.pose, &contacts, &inv_mass);
                 self.project_floor_and_bounds(&mut st.pose, &entry_pose, &inv_mass);
@@ -759,7 +1056,12 @@ impl Solver {
                 self.clamp_floor_and_arena(&mut st.pose, &inv_mass);
                 self.project_bones(&mut st.pose, &inv_mass);
             }
+            // Universal positional validity keeps the last word. The ankle
+            // envelope was projected in every main iteration above; this
+            // existing generic polish only resolves millimeter-scale conflicts
+            // with floor, contact, and bone constraints.
             self.clamp_arena(&mut st.pose, &inv_mass);
+            self.lift_unpinned_pose_to_mat(&mut st.pose);
 
             // -- Velocity update from actual displacement.
             for pj in PlayerJoint::all() {
@@ -774,6 +1076,22 @@ impl Solver {
             //    velocity that the next substep amplifies (an energy pump that
             //    slowly shakes tightly-entangled poses apart).
             self.damp_grip_velocities(&st.pose, &grip_active, &st.grip_release, &mut st.velocity);
+
+            // The soft release correction is a controlled angular servo, not
+            // momentum to integrate again next substep. Critically damp its
+            // heel/toe coordinates after velocity reconstruction so the
+            // configured angular rate cap also bounds frame-to-frame release.
+            for player in PlayerId::ALL {
+                for leg_index in 0..LEG_GROUPS.len() {
+                    if st.ankle_release_active[player.index()][leg_index]
+                        && !ankle_driven[player.index()][leg_index]
+                    {
+                        for joint in &LEG_GROUPS[leg_index][3..] {
+                            st.velocity[player.index()][joint.index()] = V3::ZERO;
+                        }
+                    }
+                }
+            }
 
             crate::tone::adapt_rest_shape(
                 &st.pose,
@@ -843,8 +1161,7 @@ impl Solver {
             let len = g.len + release[i];
             let cap = &self.caps[g.cap];
             let (ea, eb) = (cap.a(), cap.b());
-            let (anchor, s) =
-                gm_core::closest_point_on_segment(pose[g.joint], pose[ea], pose[eb]);
+            let (anchor, s) = gm_core::closest_point_on_segment(pose[g.joint], pose[ea], pose[eb]);
             let delta = pose[g.joint] - anchor;
             let dist = delta.length();
             if dist <= len + 1e-9 || dist < 1e-9 {
@@ -879,8 +1196,7 @@ impl Solver {
             }
             let cap = &self.caps[g.cap];
             let (ea, eb) = (cap.a(), cap.b());
-            let (anchor, s) =
-                gm_core::closest_point_on_segment(pose[g.joint], pose[ea], pose[eb]);
+            let (anchor, s) = gm_core::closest_point_on_segment(pose[g.joint], pose[ea], pose[eb]);
             let delta = pose[g.joint] - anchor;
             let dist = delta.length();
             if dist < g.len + release[i] - 0.005 || dist < 1e-9 {
@@ -899,8 +1215,7 @@ impl Solver {
             let mj = g.joint.joint.mass();
             let ma = ea.joint.mass() * (1.0 - s) + eb.joint.mass() * s;
             let total = mj + ma;
-            velocity[g.joint.player.index()][g.joint.joint.index()] -=
-                n * (sep * ma / total);
+            velocity[g.joint.player.index()][g.joint.joint.index()] -= n * (sep * ma / total);
             let up = n * (sep * mj / total);
             velocity[ea.player.index()][ea.joint.index()] += up * (1.0 - s);
             velocity[eb.player.index()][eb.joint.index()] += up * s;
@@ -1070,6 +1385,26 @@ impl Solver {
             let p = &mut pose[pj];
             p.x = gm_core::clamp(p.x, -ext, ext);
             p.z = gm_core::clamp(p.z, -ext, ext);
+        }
+    }
+
+    /// Restore the physical mat-compression bound without perturbing any
+    /// relative geometry.  With no application pins, adding one common
+    /// vertical displacement to every joint is a rigid translation: all bone
+    /// lengths, angles, capsule clearances, and topology observables are
+    /// exactly invariant.  If a pin exists, this pass yields to it.
+    fn lift_unpinned_pose_to_mat(&self, pose: &mut Pose) {
+        if !self.pins.is_empty() {
+            return;
+        }
+        let lift = PlayerJoint::all().fold(0.0f64, |required, pj| {
+            required.max(pj.joint.radius() - MAT_COMPRESSION_ALLOWANCE - pose[pj].y)
+        });
+        if lift <= 0.0 {
+            return;
+        }
+        for pj in PlayerJoint::all() {
+            pose[pj].y += lift;
         }
     }
 

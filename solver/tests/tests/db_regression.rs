@@ -2,6 +2,9 @@
 //! the calibrated invariants, and must stay put when the solver settles it.
 
 use gm_solver::{Solver, SolverConfig, SolverState};
+use gm_solver::ankle_constraints::{
+    ankle_angles, capture_ankle_reference, project_hard_ankle_envelopes, LegSide,
+};
 use gm_validate::{penetration_floors, validate_pose, Tolerances};
 
 /// Every frame of every entry (positions and transition keyframes) validates.
@@ -32,6 +35,88 @@ fn every_database_frame_validates() {
         }
     }
     assert!(checked > 8000, "checked {} frames", checked);
+}
+
+/// Every authored frame is a valid neutral center for the local ankle model.
+/// The hard projection must be an identity at load, including near-straight
+/// poses that use the explicit pelvis-transported fallback.
+#[test]
+fn every_database_ankle_is_finite_and_unchanged_at_load() {
+    let entries = gm_tests::load_database();
+    let config = SolverConfig::default();
+    let movable = |_: gm_core::PlayerJoint| 1.0;
+    let mut checked = 0usize;
+    for entry in &entries {
+        for (frame_index, pose) in entry.frames.iter().enumerate() {
+            let references = gm_solver::ankle_constraints::capture_ankle_references(pose);
+            for player in gm_core::PlayerId::ALL {
+                for side in LegSide::ALL {
+                    let reference = capture_ankle_reference(pose, player, side);
+                    let angles = ankle_angles(pose, player, side, &reference).unwrap_or_else(|| {
+                        panic!(
+                            "{} frame {frame_index}, player {}, {side:?}: degenerate foot",
+                            entry.name(),
+                            player.index(),
+                        )
+                    });
+                    assert!(angles.swing.abs() < 1e-7);
+                    assert!(angles.twist.abs() < 1e-7);
+                    checked += 1;
+                }
+            }
+            let mut projected = *pose;
+            project_hard_ankle_envelopes(
+                &mut projected,
+                &references,
+                config.ankle_swing_limit,
+                config.ankle_twist_limit,
+                &movable,
+            );
+            assert_eq!(
+                projected,
+                *pose,
+                "{} frame {frame_index}: authored neutral was rewritten",
+                entry.name(),
+            );
+        }
+    }
+    assert!(checked > 32_000, "checked only {checked} authored ankles");
+}
+
+/// The default 100-degree limits are data-calibrated: they preserve at least
+/// 99% of observed adjacent-frame local ankle changes, while every larger jump
+/// remains loadable as its own authored neutral (proved by the test above).
+#[test]
+fn default_ankle_envelope_covers_database_motion_without_allowing_a_half_turn() {
+    let entries = gm_tests::load_database();
+    let config = SolverConfig::default();
+    assert!(config.ankle_swing_limit < std::f64::consts::PI - 0.5);
+    assert!(config.ankle_twist_limit < std::f64::consts::PI - 0.5);
+    let mut checked = 0usize;
+    let mut swing_inside = 0usize;
+    let mut twist_inside = 0usize;
+    for entry in &entries {
+        for pair in entry.frames.windows(2) {
+            for player in gm_core::PlayerId::ALL {
+                for side in LegSide::ALL {
+                    let reference = capture_ankle_reference(&pair[0], player, side);
+                    let angles = ankle_angles(&pair[1], player, side, &reference).unwrap();
+                    swing_inside += usize::from(angles.swing <= config.ankle_swing_limit);
+                    twist_inside += usize::from(angles.twist.abs() <= config.ankle_twist_limit);
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 24_000, "checked only {checked} adjacent ankles");
+    assert!(
+        swing_inside * 100 >= checked * 99,
+        "default swing limit covered only {swing_inside}/{checked} adjacent changes",
+    );
+    assert!(
+        twist_inside * 100 >= checked * 99,
+        "default twist limit covered only {twist_inside}/{checked} adjacent changes",
+    );
 }
 
 /// Named positions behave physically when the solver runs with no input.

@@ -26,6 +26,16 @@ pub struct SolverConfig {
     /// Deviation dead zone (m) below which the held shape does not adapt, so
     /// gravity sag and constraint noise never melt the pose.
     pub tone_deadzone: f64,
+    /// Rest-relative ankle orientation dead zone (radians). Inside this cone
+    /// the soft foot-to-shin constraint is exactly inactive.
+    pub ankle_orientation_deadzone: f64,
+    /// Fraction of ankle swing/twist error outside the dead zone corrected per
+    /// substep. This is compliant pose retention, separate from the hard limit.
+    pub ankle_orientation_stiffness: f64,
+    /// Hard rest-relative heel-to-toe swing limit (radians).
+    pub ankle_swing_limit: f64,
+    /// Hard rest-relative foot-plane twist limit (radians).
+    pub ankle_twist_limit: f64,
     /// Balance servo: fraction of the COM-over-support drift corrected per
     /// substep while the body is standing on its feet. Models active human
     /// balance (ankle strategy); without it a standing body is an unstable
@@ -47,8 +57,8 @@ pub struct SolverConfig {
     pub friction: f64,
     /// Floor friction coefficient in [0, 1].
     pub floor_friction: f64,
-    /// Watchdog: max whole-step re-solves (each doubling substeps) when a
-    /// segment crossing (topology change) is detected.
+    /// Watchdog: max whole-step re-solves (each doubling substeps) when any
+    /// accepted-state invariant or topology bound would be violated.
     pub max_retries: usize,
     /// Arena half-extent in x and z (GrappleMap database encoding requires
     /// coordinates within [-2, 2]).
@@ -65,6 +75,10 @@ impl Default for SolverConfig {
             tone_stiffness: 0.4,
             tone_plasticity: 0.0,
             tone_deadzone: 0.05,
+            ankle_orientation_deadzone: 2.0 * std::f64::consts::PI / 45.0, // 8 degrees
+            ankle_orientation_stiffness: 0.03,
+            ankle_swing_limit: 5.0 * std::f64::consts::PI / 9.0, // 100 degrees
+            ankle_twist_limit: 5.0 * std::f64::consts::PI / 9.0, // 100 degrees
             balance_stiffness: 0.05,
             balance_margin: 0.15,
             contact_margin: 0.02,

@@ -4,6 +4,8 @@
 use gm_core::{v3, Joint::*, PlayerJoint, Pose, P0};
 use std::path::PathBuf;
 
+pub mod lower_limb_metrics;
+
 /// Path to the canonical GrappleMap.txt at the repository root.
 pub fn database_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../GrappleMap.txt")

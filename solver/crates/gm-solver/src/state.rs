@@ -15,6 +15,10 @@ pub struct SolverState {
     /// consulted when near straight to block hyperextension (bending past
     /// straight to the opposite side). `None` until first observed bent.
     pub bend_ref_local: [[Option<V3>; HINGE_COUNT]; PLAYER_COUNT],
+    /// A foot-orientation drive has displaced this ankle and its release is
+    /// still being unloaded by the soft local constraint. This gates gradual
+    /// tone recovery so unrelated idle ankle motion never relaxes a leg.
+    pub ankle_release_active: [[bool; 2]; PLAYER_COUNT],
     /// Muscle-tone rest shape per player: joint offsets from the mass-weighted
     /// centroid. Plastically adapted each step (see `tone`).
     pub tone_rest: crate::tone::RestShape,
@@ -42,6 +46,7 @@ impl SolverState {
             pose,
             velocity: [[V3::ZERO; JOINT_COUNT]; PLAYER_COUNT],
             bend_ref_local: [[None; HINGE_COUNT]; PLAYER_COUNT],
+            ankle_release_active: [[false; 2]; PLAYER_COUNT],
             tone_rest: crate::tone::capture_rest_shape(&pose),
             broken_grips: 0,
             grip_strain: [0.0; 32],
