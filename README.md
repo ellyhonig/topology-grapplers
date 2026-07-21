@@ -52,10 +52,12 @@ In addition, there is:
 `src/solver-demo.html` is a browser demo that renders two grapplers with
 [Babylon.js](https://www.babylonjs.com/) and drives their bodies through a Rust
 XPBD constraint solver compiled to WebAssembly (`src/solver-demo/pkg/`, built
-with `wasm-pack`). Each grappler carries five 6-DOF trackers — hands, feet, and
-head, like a VR tracker rig. On desktop you engage a tracker and move it with
-the gizmo; in a headset the trackers follow your controllers or hand tracking,
-with the active gizmo parented directly to its XR transform. The body follows
+with `wasm-pack`). Its editable Rust workspace, including muscle-tone and
+constraint code, is in `solver/`. Each grappler carries five 6-DOF trackers —
+hands, feet, and head, like a VR tracker rig. On desktop you engage a tracker
+and move it with the gizmo; in a headset the trackers follow your controllers
+or hand tracking, with the active gizmo parented directly to its XR transform.
+The body follows
 under gravity, muscle tone, and anatomy limits. Positions
 are loaded from the top-level `GrappleMap.txt`. In VR, choose whether to drive
 the red or blue grappler, position the shared menu/grappler stage, adjust the
