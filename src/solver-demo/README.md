@@ -86,20 +86,19 @@ URL that serves only the `src` directory breaks the `/GrappleMap.txt` request.
 
 ## Rebuild the WASM package
 
-The Rust source currently lives in the sibling `grapple-solver` workspace. If
-both directories share the same parent:
+The complete Rust workspace lives in this repository under `solver/`:
 
 ```text
-grapplemapapp/
-├── grapple-solver/
-└── topology-grapplers/
+topology-grapplers/
+├── solver/
+└── src/solver-demo/pkg/
 ```
 
-install Rust and `wasm-pack`, then run from `grapple-solver`:
+Install Rust and `wasm-pack`, then run from `solver/`:
 
 ```sh
 wasm-pack build crates/gm-wasm --target web \
-  --out-dir ../../../topology-grapplers/src/solver-demo/pkg
+  --out-dir ../../../src/solver-demo/pkg
 ```
 
 Commit the regenerated files in `src/solver-demo/pkg` whenever the Rust solver
