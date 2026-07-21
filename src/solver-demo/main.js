@@ -42,9 +42,9 @@ var gizmoManager = null;
 var selectedTracker = null;
 var headChildRotation = null;
 
-// WebXR controls one selected grappler by parenting tracker gizmos directly to
-// the headset and controller transform nodes. No pose-delta calibration layer
-// sits between the hardware and the solver targets.
+// WebXR controls one selected grappler. Head and hand trackers snap directly
+// to the headset/controller nodes; a clutched foot sits under a temporary
+// pivot that follows the controller's motion delta from the capture pose.
 var vr = {
 	supported: false,
 	active: false,
@@ -55,12 +55,13 @@ var vr = {
 	waitForTriggerRelease: false,
 	player: 0,
 	stageDistance: 1.6,
+	stageYaw: 0,
 	floorOffset: 0,
 	experience: null,
 	menu: null,
 	controllers: {
-		left: { source: null, mode: "hand", attachedTracker: null, triggerWasPressed: false, triggerCapturedByUi: false, buttonStates: null },
-		right: { source: null, mode: "hand", attachedTracker: null, triggerWasPressed: false, triggerCapturedByUi: false, buttonStates: null }
+		left: { source: null, mode: "hand", attachedTracker: null, triggerWasPressed: false, triggerCapturedByUi: false, buttonStates: null, menuDrag: null },
+		right: { source: null, mode: "hand", attachedTracker: null, triggerWasPressed: false, triggerCapturedByUi: false, buttonStates: null, menuDrag: null }
 	},
 	lastStatus: ""
 };
@@ -223,10 +224,12 @@ function syncDisengagedTrackers() {
 
 function setTrackerEngaged(t, engaged) {
 	if (!engaged && t.xrNode) {
+		var pivot = t.xrAttachment && t.xrAttachment.pivot;
 		t.xrNode = null;
 		t.xrAttachment = null;
 		t.mesh.parent = stageRoot;
 		t.mesh.isPickable = true;
+		if (pivot) pivot.dispose();
 	}
 	if (!engaged) t.xrAttachment = null;
 	if (t.engaged === engaged) return;
@@ -359,62 +362,77 @@ function rotateVector(vector, rotation) {
 	return result;
 }
 
-function updatePreservedTrackerPose(tracker, parentPose) {
+function quaternionAngleBetween(a, b) {
+	var dot = Math.abs(BABYLON.Quaternion.Dot(a, b));
+	return 2 * Math.acos(Math.max(-1, Math.min(1, dot)));
+}
+
+function updateFootPivotPose(tracker, parentPose) {
 	var attachment = tracker && tracker.xrAttachment;
 	var node = tracker && tracker.xrNode;
-	if (!attachment || attachment.mode !== "preserve" || !node) return false;
+	if (!attachment || attachment.mode !== "foot-pivot" || !attachment.pivot || !node) return false;
 	parentPose = parentPose || nodeWorldPose(node);
 	if (!parentPose) return false;
 
-	// Controller translation moves the foot one-to-one while the captured
-	// world-space offset stays fixed. Controller rotation changes foot
-	// orientation without orbiting the ankle target around the controller.
-	var worldPosition = parentPose.position.add(attachment.positionOffset);
+	// Translation and rotation are independent pose deltas. This makes the
+	// pivot copy controller motion exactly without rotating its position around
+	// the controller when the hand and foot were separated at capture time.
+	var worldPosition = attachment.initialPivotPosition.add(
+		parentPose.position.subtract(attachment.initialParentPosition)
+	);
 	var parentDelta = parentPose.rotation.multiply(
 		BABYLON.Quaternion.Inverse(attachment.initialParentRotation)
 	);
 	parentDelta.normalize();
-	var worldRotation = parentDelta.multiply(attachment.initialTrackerRotation);
+	var worldRotation = parentDelta.multiply(attachment.initialPivotRotation);
 	worldRotation.normalize();
 
-	node.computeWorldMatrix(true);
-	var inverseParent = node.getWorldMatrix().clone();
-	inverseParent.invert();
-	var localPosition = BABYLON.Vector3.TransformCoordinates(worldPosition, inverseParent);
-	var localRotation = BABYLON.Quaternion.Inverse(parentPose.rotation).multiply(worldRotation);
-	localRotation.normalize();
-	tracker.mesh.position.copyFrom(localPosition);
-	tracker.mesh.rotationQuaternion.copyFrom(localRotation);
+	attachment.pivot.position.copyFrom(worldPosition);
+	attachment.pivot.rotationQuaternion.copyFrom(worldRotation);
+	attachment.pivot.computeWorldMatrix(true);
 	tracker.mesh.computeWorldMatrix(true);
 	return true;
 }
 
-function updatePreservedFootTrackers() {
+function updateFootPivotTrackers() {
 	trackers.forEach(function (tracker) {
-		if (tracker.xrAttachment && tracker.xrAttachment.mode === "preserve") {
-			updatePreservedTrackerPose(tracker);
+		if (tracker.xrAttachment && tracker.xrAttachment.mode === "foot-pivot") {
+			updateFootPivotPose(tracker);
 		}
 	});
 }
 
+function attachFootTrackerToXrNode(tracker, node) {
+	var trackerPose = nodeWorldPose(tracker.mesh);
+	var parentPose = nodeWorldPose(node);
+	if (!trackerPose || !parentPose) return false;
+	var pivot = new BABYLON.TransformNode("xr-foot-pivot", scene);
+	pivot.position.copyFrom(trackerPose.position);
+	pivot.rotationQuaternion = trackerPose.rotation.clone();
+	pivot.computeWorldMatrix(true);
+	tracker.xrAttachment = {
+		mode: "foot-pivot",
+		pivot: pivot,
+		initialParentPosition: parentPose.position.clone(),
+		initialParentRotation: parentPose.rotation.clone(),
+		initialPivotPosition: trackerPose.position.clone(),
+		initialPivotRotation: trackerPose.rotation.clone()
+	};
+	tracker.xrNode = node;
+	tracker.mesh.parent = pivot;
+	tracker.mesh.position.copyFromFloats(0, 0, 0);
+	tracker.mesh.rotationQuaternion.copyFrom(BABYLON.Quaternion.Identity());
+	tracker.mesh.computeWorldMatrix(true);
+	return updateFootPivotPose(tracker, parentPose);
+}
+
 function attachTrackerToXrNode(tracker, node, attachmentMode, childRotation) {
 	if (!tracker || !node) return false;
-	if (attachmentMode === "preserve") {
-		var trackerPose = nodeWorldPose(tracker.mesh);
-		var parentPose = nodeWorldPose(node);
-		if (!trackerPose || !parentPose) return false;
-		tracker.xrAttachment = {
-			mode: "preserve",
-			positionOffset: trackerPose.position.subtract(parentPose.position),
-			initialParentRotation: parentPose.rotation.clone(),
-			initialTrackerRotation: trackerPose.rotation.clone()
-		};
-	}
-	tracker.xrNode = node;
-	tracker.mesh.parent = node;
-	if (attachmentMode === "preserve") {
-		updatePreservedTrackerPose(tracker, parentPose);
+	if (attachmentMode === "foot-pivot") {
+		if (!attachFootTrackerToXrNode(tracker, node)) return false;
 	} else {
+		tracker.xrNode = node;
+		tracker.mesh.parent = node;
 		tracker.xrAttachment = { mode: "snap" };
 		tracker.mesh.position.copyFromFloats(0, 0, 0);
 		tracker.mesh.rotationQuaternion.copyFrom(childRotation || BABYLON.Quaternion.Identity());
@@ -432,24 +450,19 @@ function horizontalForward(rotation) {
 	return forward.normalize();
 }
 
-function recenterVrMenu(force) {
+function placeVrSetupOnce() {
 	if (!vr.active || !vr.menu || vr.menuLocked) return;
 	var cameraPose = nodeWorldPose(vr.experience.baseExperience.camera);
 	if (!cameraPose) return;
 	var forward = horizontalForward(cameraPose.rotation);
-	var toMenu = vr.menu.plane.position.subtract(cameraPose.position);
-	toMenu.y = 0;
-	var outsideFollowCone = toMenu.lengthSquared() < 1e-6 ||
-		BABYLON.Vector3.Dot(forward, toMenu.normalize()) < Math.cos(Math.PI / 6);
-	if (!force && !outsideFollowCone) return;
 	vr.menu.plane.position.copyFrom(cameraPose.position.add(forward.scale(1.15)));
 	vr.menu.plane.position.y = cameraPose.position.y - 0.12;
 	// Babylon GUI is drawn on the plane's front face. The yaw correction turns
 	// that face toward the HMD instead of showing the mirrored back face.
 	vr.menu.plane.lookAt(cameraPose.position, Math.PI, 0, 0, BABYLON.Space.WORLD);
-	// During setup the characters travel with the menu. The first tracking
-	// trigger locks both transforms in the play space.
-	if (!vr.started) placeStageInFront();
+	// The menu and stage are placed once on VR entry. Looking away never moves
+	// either transform; setup adjustments are exclusively user controlled.
+	placeStageInFront();
 }
 
 function placeStageInFront() {
@@ -462,7 +475,7 @@ function placeStageInFront() {
 	if (!Number.isFinite(eyeHeight) || eyeHeight < 0.8) eyeHeight = 1.65;
 	stageRoot.position.copyFrom(cameraPose.position.add(forward.scale(vr.stageDistance)));
 	stageRoot.position.y = cameraPose.position.y - eyeHeight + vr.floorOffset;
-	stageRoot.rotationQuaternion.copyFrom(BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Y, yaw));
+	stageRoot.rotationQuaternion.copyFrom(BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Y, yaw + vr.stageYaw));
 	stageRoot.computeWorldMatrix(true);
 	vr.stagePlaced = true;
 	return true;
@@ -474,6 +487,7 @@ function floorOffsetText(value) {
 }
 
 function setFloorOffset(value) {
+	if (vr.active && vr.started) return;
 	var next = Math.max(-0.75, Math.min(0.75, Math.round(Number(value) * 20) / 20));
 	if (!Number.isFinite(next)) return;
 	var delta = next - vr.floorOffset;
@@ -496,6 +510,7 @@ function nudgeFloor(direction) {
 }
 
 function setStageDistance(value) {
+	if (vr.active && vr.started) return;
 	var next = Math.max(1, Math.min(3, Math.round(Number(value) * 10) / 10));
 	if (!Number.isFinite(next)) return;
 	var changed = next !== vr.stageDistance;
@@ -512,6 +527,31 @@ function setStageDistance(value) {
 	}
 	if (!changed || !vr.active || !vr.experience) return;
 	placeStageInFront();
+}
+
+function normalizedDegrees(value) {
+	var degrees = Math.round(Number(value) / 5) * 5;
+	if (!Number.isFinite(degrees)) return null;
+	while (degrees > 180) degrees -= 360;
+	while (degrees < -180) degrees += 360;
+	return degrees;
+}
+
+function setStageYaw(value) {
+	if (vr.active && vr.started) return;
+	var degrees = normalizedDegrees(value);
+	if (degrees === null) return;
+	vr.stageYaw = degrees * Math.PI / 180;
+	var input = byId("sceneYaw");
+	var output = byId("sceneYawOut");
+	if (input && Number(input.value) !== degrees) input.value = degrees;
+	if (output) output.textContent = degrees + "\u00b0";
+	if (vr.menu && vr.menu.yawLabel) vr.menu.yawLabel.text = "Scene turn: " + degrees + "\u00b0";
+	if (vr.active && vr.experience) placeStageInFront();
+}
+
+function nudgeStageYaw(direction) {
+	setStageYaw(vr.stageYaw * 180 / Math.PI + direction * 15);
 }
 
 function controllerNode(source) {
@@ -537,18 +577,99 @@ function triggerButtonIndex(source) {
 	return Number.isInteger(index) ? index : 0;
 }
 
-function pickVrMenu(source) {
-	if (!source || !vr.menu || !vr.menu.plane.isEnabled()) return null;
+function controllerPointerRay(source) {
+	if (!source || typeof source.getWorldPointerRayToRef !== "function") return null;
 	var ray = new BABYLON.Ray(BABYLON.Vector3.Zero(), BABYLON.Axis.Z, 10);
-	if (typeof source.getWorldPointerRayToRef !== "function") return null;
 	source.getWorldPointerRayToRef(ray);
 	ray.length = 10;
-	var pick = scene.pickWithRay(ray, function (mesh) { return mesh === vr.menu.plane; });
+	return ray;
+}
+
+function horizontalPointerDirection(source) {
+	var ray = controllerPointerRay(source);
+	if (!ray) return null;
+	var direction = ray.direction.clone();
+	direction.y = 0;
+	if (direction.lengthSquared() < 1e-6) return null;
+	return direction.normalize();
+}
+
+function menuOrbitPosition(cameraPosition, pointerDirection, drag) {
+	var pointerYaw = Math.atan2(pointerDirection.x, pointerDirection.z);
+	var menuYaw = pointerYaw + drag.yawOffset;
+	return v3(
+		cameraPosition.x + Math.sin(menuYaw) * drag.radius,
+		cameraPosition.y + drag.heightOffset,
+		cameraPosition.z + Math.cos(menuYaw) * drag.radius
+	);
+}
+
+function pickVrMenu(source) {
+	if (!source || !vr.menu || !vr.menu.plane.isEnabled()) return null;
+	var ray = controllerPointerRay(source);
+	if (!ray) return null;
+	var pick = scene.pickWithRay(ray, function (mesh) {
+		return mesh === vr.menu.plane || mesh === vr.menu.handle;
+	});
 	return pick && pick.hit ? pick : null;
 }
 
+function setVrMenuHandleActive(active) {
+	if (!vr.menu || !vr.menu.handle) return;
+	vr.menu.handle.scaling.copyFromFloats(active ? 1.18 : 1, active ? 1.18 : 1, active ? 1.18 : 1);
+	vr.menu.handle.material.emissiveColor.copyFrom(active
+		? new BABYLON.Color3(0.25, 0.85, 1)
+		: new BABYLON.Color3(0.04, 0.25, 0.45));
+}
+
+function beginVrMenuDrag(side, source) {
+	if (!vr.menu || !vr.experience || (vr.menu.draggingSide && vr.menu.draggingSide !== side)) return false;
+	var cameraPose = nodeWorldPose(vr.experience.baseExperience.camera);
+	var pointerDirection = horizontalPointerDirection(source);
+	if (!cameraPose || !pointerDirection) return false;
+	var menuOffset = vr.menu.plane.position.subtract(cameraPose.position);
+	menuOffset.y = 0;
+	var radius = menuOffset.length();
+	if (radius < 0.55) radius = 1.15;
+	var menuYaw = Math.atan2(menuOffset.x, menuOffset.z);
+	var pointerYaw = Math.atan2(pointerDirection.x, pointerDirection.z);
+	vr.controllers[side].menuDrag = {
+		radius: radius,
+		heightOffset: vr.menu.plane.position.y - cameraPose.position.y,
+		yawOffset: menuYaw - pointerYaw
+	};
+	vr.menu.draggingSide = side;
+	setVrMenuHandleActive(true);
+	return true;
+}
+
+function endVrMenuDrag(side) {
+	var state = vr.controllers[side];
+	state.menuDrag = null;
+	if (vr.menu && vr.menu.draggingSide === side) {
+		vr.menu.draggingSide = null;
+		setVrMenuHandleActive(false);
+	}
+}
+
+function updateVrMenuDrag(side) {
+	var state = vr.controllers[side];
+	if (!state.menuDrag) return false;
+	if (!state.source || !triggerPressed(state.source)) {
+		endVrMenuDrag(side);
+		return false;
+	}
+	var cameraPose = nodeWorldPose(vr.experience.baseExperience.camera);
+	var pointerDirection = horizontalPointerDirection(state.source);
+	if (!cameraPose || !pointerDirection) return false;
+	vr.menu.plane.position.copyFrom(menuOrbitPosition(cameraPose.position, pointerDirection, state.menuDrag));
+	vr.menu.plane.lookAt(cameraPose.position, Math.PI, 0, 0, BABYLON.Space.WORLD);
+	vr.menu.plane.computeWorldMatrix(true);
+	return true;
+}
+
 function activatePointedVrControl(side, pick) {
-	if (!pick) return false;
+	if (!pick || pick.pickedMesh === vr.menu.handle) return false;
 	var pointerId = side === "left" ? 2101 : 2102;
 	var eventInit = { pointerId: pointerId, button: 0, buttons: 1 };
 	scene.simulatePointerMove(pick, eventInit);
@@ -562,6 +683,7 @@ function resetControllerInputState(state) {
 	state.triggerWasPressed = triggerPressed(state.source);
 	state.triggerCapturedByUi = false;
 	state.buttonStates = null;
+	state.menuDrag = null;
 }
 
 function pollControllerInput(side) {
@@ -571,8 +693,14 @@ function pollControllerInput(side) {
 	var triggerDown = triggerIsPressed && !state.triggerWasPressed;
 	state.triggerWasPressed = triggerIsPressed;
 	var menuPick = triggerDown ? pickVrMenu(source) : null;
-	if (triggerDown) state.triggerCapturedByUi = !!menuPick;
-	else if (!triggerIsPressed) state.triggerCapturedByUi = false;
+	if (triggerDown) {
+		state.triggerCapturedByUi = !!menuPick;
+		if (menuPick && menuPick.pickedMesh === vr.menu.handle) beginVrMenuDrag(side, source);
+	} else if (!triggerIsPressed) {
+		state.triggerCapturedByUi = false;
+		endVrMenuDrag(side);
+	}
+	if (state.menuDrag) updateVrMenuDrag(side);
 	var activatedUi = false;
 	var gamepad = source && source.inputSource && source.inputSource.gamepad;
 	if (gamepad && gamepad.buttons) {
@@ -582,7 +710,7 @@ function pollControllerInput(side) {
 		if (state.buttonStates && state.buttonStates.length === nextStates.length) {
 			var triggerIndex = triggerButtonIndex(source);
 			for (var i = 0; i < nextStates.length; ++i) {
-				if (i === triggerIndex || !nextStates[i] || state.buttonStates[i]) continue;
+				if (state.menuDrag || i === triggerIndex || !nextStates[i] || state.buttonStates[i]) continue;
 				menuPick = menuPick || pickVrMenu(source);
 				if (!activatedUi) activatedUi = activatePointedVrControl(side, menuPick);
 			}
@@ -627,7 +755,7 @@ function attachControllerTracker(side, mode) {
 	if (previousTracker && previousTracker !== targetTracker) setTrackerEngaged(previousTracker, false);
 	state.mode = mode;
 	state.attachedTracker = targetTracker;
-	var attachmentMode = mode === "foot" ? "preserve" : "snap";
+	var attachmentMode = mode === "foot" ? "foot-pivot" : "snap";
 	var attached = attachTrackerToXrNode(targetTracker, node, attachmentMode, BABYLON.Quaternion.Identity());
 	syncDisengagedTrackers();
 	return attached;
@@ -688,6 +816,10 @@ function clearVrAttachments() {
 		state.mode = "hand";
 		resetControllerInputState(state);
 	});
+	if (vr.menu) {
+		vr.menu.draggingSide = null;
+		setVrMenuHandleActive(false);
+	}
 	vr.waitForTriggerRelease = false;
 }
 
@@ -724,7 +856,6 @@ function updateVrInput() {
 	if (!vr.active || !vr.experience) return;
 	var input = pollVrControllerInput();
 	if (!vr.started) {
-		recenterVrMenu(false);
 		if (input.startTriggerDown) startVrTracking();
 		refreshVrStatus();
 		return;
@@ -732,7 +863,7 @@ function updateVrInput() {
 	if (input.anyTriggerPressed === false) vr.waitForTriggerRelease = false;
 	updateController("left");
 	updateController("right");
-	updatePreservedFootTrackers();
+	updateFootPivotTrackers();
 	refreshVrStatus();
 }
 
@@ -799,7 +930,7 @@ function refreshVrStatus() {
 		text = "trackers released - point away and press trigger to resume";
 		className = "ready";
 	} else if (!vr.started) {
-		text = "setup - position yourself, then press trigger";
+		text = "setup - turn the scene, line yourself up, then press trigger";
 		className = "ready";
 	} else {
 		var left = vr.controllers.left.source ? vr.controllers.left.mode : "waiting";
@@ -824,10 +955,16 @@ function refreshVrStatus() {
 		vr.menu.release.isEnabled = vr.active && !vr.trackingPaused;
 		vr.menu.reset.alpha = vr.active ? 1 : 0.45;
 		vr.menu.release.alpha = vr.active && !vr.trackingPaused ? 1 : 0.45;
-		vr.menu.floorDown.isEnabled = vr.active;
-		vr.menu.floorUp.isEnabled = vr.active;
-		vr.menu.floorDown.alpha = vr.active ? 1 : 0.45;
-		vr.menu.floorUp.alpha = vr.active ? 1 : 0.45;
+		vr.menu.distance.isEnabled = positionEnabled;
+		vr.menu.distance.alpha = positionEnabled ? 1 : 0.45;
+		vr.menu.yawLeft.isEnabled = positionEnabled;
+		vr.menu.yawRight.isEnabled = positionEnabled;
+		vr.menu.yawLeft.alpha = positionEnabled ? 1 : 0.45;
+		vr.menu.yawRight.alpha = positionEnabled ? 1 : 0.45;
+		vr.menu.floorDown.isEnabled = positionEnabled;
+		vr.menu.floorUp.isEnabled = positionEnabled;
+		vr.menu.floorDown.alpha = positionEnabled ? 1 : 0.45;
+		vr.menu.floorUp.alpha = positionEnabled ? 1 : 0.45;
 		vr.menu.playerRed.background = vr.player === 0 ? "#a4261b" : "#35475a";
 		vr.menu.playerBlue.background = vr.player === 1 ? "#234eac" : "#35475a";
 	}
@@ -836,6 +973,9 @@ function refreshVrStatus() {
 	startButton.textContent = vr.started ? "VR controls active"
 		: vr.trackingPaused ? "Resume VR controls" : "Start tracking";
 	byId("positionSelect").disabled = vr.started;
+	byId("sceneDistance").disabled = vr.started;
+	byId("sceneYaw").disabled = vr.started;
+	byId("floorOffset").disabled = vr.started;
 	refreshVrPositionLabel();
 }
 
@@ -855,12 +995,28 @@ function createVrMenu() {
 	if (!BABYLON.GUI) return;
 	var plane = BABYLON.MeshBuilder.CreatePlane("vr-setup-menu", {
 		width: 1.05,
-		height: 1.12,
+		height: 1.22,
 		sideOrientation: BABYLON.Mesh.DOUBLESIDE
 	}, scene);
 	plane.isPickable = true;
 	plane.setEnabled(false);
-	var texture = BABYLON.GUI.AdvancedDynamicTexture.CreateForMesh(plane, 1100, 1180, false);
+	var handle = BABYLON.MeshBuilder.CreateBox("vr-menu-orbit-handle", {
+		width: 0.105,
+		height: 0.105,
+		depth: 0.075
+	}, scene);
+	handle.parent = plane;
+	handle.position.copyFromFloats(0.46, 0.555, 0);
+	handle.isPickable = true;
+	var handleMaterial = new BABYLON.StandardMaterial("vr-menu-orbit-handle-material", scene);
+	handleMaterial.diffuseColor = new BABYLON.Color3(0.1, 0.55, 0.9);
+	handleMaterial.emissiveColor = new BABYLON.Color3(0.04, 0.25, 0.45);
+	handleMaterial.specularColor = new BABYLON.Color3(0.15, 0.35, 0.5);
+	handle.material = handleMaterial;
+	handle.enableEdgesRendering();
+	handle.edgesWidth = 3;
+	handle.edgesColor = new BABYLON.Color4(0.55, 0.9, 1, 1);
+	var texture = BABYLON.GUI.AdvancedDynamicTexture.CreateForMesh(plane, 1100, 1300, false);
 	var background = new BABYLON.GUI.Rectangle("vr-menu-background");
 	background.background = "#101720";
 	background.color = "#91a5bb";
@@ -921,6 +1077,7 @@ function createVrMenu() {
 	}
 
 	addText("vr-menu-title", "GrappleMap VR", 60, 40, "#ffffff");
+	addText("vr-menu-move-hint", "Hold trigger on the blue corner to move this panel", 38, 21, "#65b5ff");
 	var status = addText("vr-menu-status", "Position yourself, then press trigger", 56, 23, "#b9cce0");
 	var position = addText("vr-menu-position", "Position", 58, 28, "#ffffff");
 	var previous = makeButton("vr-menu-previous", "Previous");
@@ -932,6 +1089,10 @@ function createVrMenu() {
 	makeTwoColumnRow("vr-menu-player-buttons", playerRed, playerBlue);
 	var distanceLabel = addText("vr-menu-distance-label", "Scene distance: " + vr.stageDistance.toFixed(1) + " m", 46, 24, "#b9cce0");
 	var distance = makeSlider("vr-menu-distance", 1, 3, vr.stageDistance, 0.1);
+	var yawLabel = addText("vr-menu-yaw-label", "Scene turn: " + Math.round(vr.stageYaw * 180 / Math.PI) + "\u00b0", 46, 24, "#b9cce0");
+	var yawLeft = makeButton("vr-menu-yaw-left", "Turn left 15\u00b0");
+	var yawRight = makeButton("vr-menu-yaw-right", "Turn right 15\u00b0");
+	makeTwoColumnRow("vr-menu-yaw-buttons", yawLeft, yawRight);
 	var floorLabel = addText("vr-menu-floor-label", "Floor height: " + floorOffsetText(vr.floorOffset), 46, 24, "#b9cce0");
 	var floorDown = makeButton("vr-menu-floor-down", "Floor -5 cm");
 	var floorUp = makeButton("vr-menu-floor-up", "Floor +5 cm");
@@ -952,6 +1113,8 @@ function createVrMenu() {
 	playerRed.onPointerUpObservable.add(function () { setControlledPlayer(0); });
 	playerBlue.onPointerUpObservable.add(function () { setControlledPlayer(1); });
 	distance.onValueChangedObservable.add(setStageDistance);
+	yawLeft.onPointerUpObservable.add(function () { nudgeStageYaw(-1); });
+	yawRight.onPointerUpObservable.add(function () { nudgeStageYaw(1); });
 	floorDown.onPointerUpObservable.add(function () { nudgeFloor(-1); });
 	floorUp.onPointerUpObservable.add(function () { nudgeFloor(1); });
 	stiffness.onValueChangedObservable.add(setTrackerStiffness);
@@ -960,6 +1123,8 @@ function createVrMenu() {
 	start.onPointerUpObservable.add(startVrTracking);
 	vr.menu = {
 		plane: plane,
+		handle: handle,
+		draggingSide: null,
 		texture: texture,
 		status: status,
 		position: position,
@@ -970,6 +1135,9 @@ function createVrMenu() {
 		playerBlue: playerBlue,
 		distanceLabel: distanceLabel,
 		distance: distance,
+		yawLabel: yawLabel,
+		yawLeft: yawLeft,
+		yawRight: yawRight,
 		floorLabel: floorLabel,
 		floorDown: floorDown,
 		floorUp: floorUp,
@@ -997,6 +1165,7 @@ function unregisterVrController(source) {
 	["left", "right"].forEach(function (side) {
 		var state = vr.controllers[side];
 		if (state.source !== source) return;
+		endVrMenuDrag(side);
 		setTrackerEngaged(trackerForControllerMode(side, "hand"), false);
 		setTrackerEngaged(trackerForControllerMode(side, "foot"), false);
 		state.source = null;
@@ -1036,7 +1205,7 @@ async function initXR() {
 				clearVrAttachments();
 				setVrTrackerVisualsVisible(vr.player, true);
 				if (vr.menu) vr.menu.plane.setEnabled(true);
-				recenterVrMenu(true);
+				placeVrSetupOnce();
 				// Setup remains untracked so the user can align with the staged
 				// grappler. The first trigger press performs the one-time snap.
 			} else if (state === BABYLON.WebXRState.NOT_IN_XR) {
@@ -1251,6 +1420,9 @@ async function boot() {
 	byId("sceneDistance").addEventListener("input", function (event) {
 		setStageDistance(event.target.value);
 	});
+	byId("sceneYaw").addEventListener("input", function (event) {
+		setStageYaw(event.target.value);
+	});
 	byId("floorOffset").addEventListener("input", function (event) {
 		setFloorOffset(event.target.value);
 	});
@@ -1258,9 +1430,36 @@ async function boot() {
 	stiffness.addEventListener("input", function (event) { setTrackerStiffness(event.target.value); });
 	setControlledPlayer(byId("vrPlayerSelect").value);
 	setStageDistance(byId("sceneDistance").value);
+	setStageYaw(byId("sceneYaw").value);
 	setFloorOffset(byId("floorOffset").value);
 	setTrackerStiffness(stiffness.value);
 	await initXR();
+	if (new URLSearchParams(window.location.search).has("selftest")) {
+		if (!vr.menu && BABYLON.GUI) createVrMenu();
+		setStageYaw(45);
+		window.gmSelfTest = {
+			footPivot: window.gmDebug.footPivotProbe(),
+			menuOrbit: window.gmDebug.menuOrbitProbe(),
+			menuHandle: {
+				exists: !!(vr.menu && vr.menu.handle),
+				parentIsPanel: !!(vr.menu && vr.menu.handle && vr.menu.handle.parent === vr.menu.plane),
+				pickable: !!(vr.menu && vr.menu.handle && vr.menu.handle.isPickable)
+			},
+			sceneTurn: {
+				degrees: Math.round(vr.stageYaw * 180 / Math.PI),
+				output: byId("sceneYawOut").textContent,
+				allTrackersUnderSharedStage: trackers.every(function (tracker) {
+					var node = tracker.mesh;
+					while (node && node !== stageRoot) node = node.parent;
+					return node === stageRoot;
+				}),
+				allGridLinesUnderSharedStage: scene.meshes.filter(function (mesh) {
+					return mesh.name === "grid-x" || mesh.name === "grid-z";
+				}).every(function (mesh) { return mesh.parent === stageRoot; })
+			}
+		};
+		document.documentElement.setAttribute("data-gm-self-test", JSON.stringify(window.gmSelfTest));
+	}
 }
 
 // Debug/testing hook: lets automation and the console inspect and drive the
@@ -1295,6 +1494,7 @@ window.gmDebug = {
 			menuLocked: vr.menuLocked,
 			player: vr.player,
 			stageDistance: vr.stageDistance,
+			stageYawDegrees: Math.round(vr.stageYaw * 180 / Math.PI),
 			floorOffset: vr.floorOffset,
 			waitForTriggerRelease: vr.waitForTriggerRelease,
 			leftTargetSide: controllerTargetSide("left"),
@@ -1303,8 +1503,89 @@ window.gmDebug = {
 			leftParented: !!(vr.controllers.left.attachedTracker && vr.controllers.left.attachedTracker.xrNode),
 			rightParented: !!(vr.controllers.right.attachedTracker && vr.controllers.right.attachedTracker.xrNode),
 			leftMode: vr.controllers.left.mode,
-			rightMode: vr.controllers.right.mode
+			rightMode: vr.controllers.right.mode,
+			leftFootPivot: !!(vr.controllers.left.attachedTracker &&
+				vr.controllers.left.attachedTracker.xrAttachment &&
+				vr.controllers.left.attachedTracker.xrAttachment.mode === "foot-pivot"),
+			rightFootPivot: !!(vr.controllers.right.attachedTracker &&
+				vr.controllers.right.attachedTracker.xrAttachment &&
+				vr.controllers.right.attachedTracker.xrAttachment.mode === "foot-pivot")
 		};
+	},
+	setStageYaw: function (degrees) { setStageYaw(degrees); },
+	menuOrbitProbe: function () {
+		var cameraPosition = v3(0.2, 1.65, -0.4);
+		var drag = { radius: 1.3, heightOffset: -0.18, yawOffset: 0.35 };
+		var start = menuOrbitPosition(cameraPosition, v3(0, 0, 1), drag);
+		var quarterTurn = menuOrbitPosition(cameraPosition, v3(1, 0, 0), drag);
+		var startOffset = start.subtract(cameraPosition);
+		var turnedOffset = quarterTurn.subtract(cameraPosition);
+		var startYaw = Math.atan2(startOffset.x, startOffset.z);
+		var turnedYaw = Math.atan2(turnedOffset.x, turnedOffset.z);
+		var yawDelta = turnedYaw - startYaw;
+		while (yawDelta > Math.PI) yawDelta -= Math.PI * 2;
+		while (yawDelta < -Math.PI) yawDelta += Math.PI * 2;
+		startOffset.y = 0;
+		turnedOffset.y = 0;
+		return {
+			startRadiusError: Math.abs(startOffset.length() - drag.radius),
+			turnedRadiusError: Math.abs(turnedOffset.length() - drag.radius),
+			heightError: Math.max(
+				Math.abs(start.y - cameraPosition.y - drag.heightOffset),
+				Math.abs(quarterTurn.y - cameraPosition.y - drag.heightOffset)
+			),
+			quarterTurnAngleError: Math.abs(yawDelta - Math.PI / 2)
+		};
+	},
+	// Exercise the real temporary-pivot code without requiring an XR session.
+	// Returned errors are in metres/radians and should be approximately zero.
+	footPivotProbe: function () {
+		var controller = new BABYLON.TransformNode("foot-pivot-probe-controller", scene);
+		controller.position.copyFromFloats(0.8, 1.35, -0.25);
+		controller.rotationQuaternion = BABYLON.Quaternion.RotationYawPitchRoll(0.3, -0.12, 0.08);
+		var foot = new BABYLON.TransformNode("foot-pivot-probe-foot", scene);
+		foot.position.copyFromFloats(-0.45, 0.18, 0.65);
+		foot.rotationQuaternion = BABYLON.Quaternion.RotationYawPitchRoll(-0.4, 0.22, -0.15);
+		controller.computeWorldMatrix(true);
+		foot.computeWorldMatrix(true);
+		var before = nodeWorldPose(foot);
+		var beforeStage = nodePoseInStage(foot);
+		var probeTracker = { mesh: foot, xrNode: null, xrAttachment: null };
+		var attached = attachFootTrackerToXrNode(probeTracker, controller);
+		var captured = nodeWorldPose(foot);
+		var capturedStage = nodePoseInStage(foot);
+		var pivot = probeTracker.xrAttachment && probeTracker.xrAttachment.pivot;
+		var footParentIsPivot = foot.parent === pivot;
+		var pivotIsNotControllerChild = pivot && pivot.parent !== controller;
+
+		var translation = v3(0.27, -0.09, 0.14);
+		var rotationDelta = BABYLON.Quaternion.RotationYawPitchRoll(0.55, -0.2, 0.17);
+		controller.position.addInPlace(translation);
+		controller.rotationQuaternion.copyFrom(rotationDelta.multiply(controller.rotationQuaternion));
+		controller.computeWorldMatrix(true);
+		updateFootPivotPose(probeTracker);
+		var moved = nodeWorldPose(foot);
+		var expectedPosition = before.position.add(translation);
+		var expectedRotation = rotationDelta.multiply(before.rotation);
+		expectedRotation.normalize();
+		var result = {
+			attached: attached,
+			footParentIsPivot: footParentIsPivot,
+			pivotIsNotControllerChild: pivotIsNotControllerChild,
+			capturePositionError: BABYLON.Vector3.Distance(before.position, captured.position),
+			captureOrientationError: quaternionAngleBetween(before.rotation, captured.rotation),
+			captureStagePositionError: BABYLON.Vector3.Distance(beforeStage.position, capturedStage.position),
+			captureStageOrientationError: quaternionAngleBetween(beforeStage.rotation, capturedStage.rotation),
+			translationError: BABYLON.Vector3.Distance(expectedPosition, moved.position),
+			rotationError: quaternionAngleBetween(expectedRotation, moved.rotation),
+			localPositionError: foot.position.length(),
+			localOrientationError: quaternionAngleBetween(foot.rotationQuaternion, BABYLON.Quaternion.Identity())
+		};
+		foot.parent = null;
+		if (pivot) pivot.dispose();
+		foot.dispose();
+		controller.dispose();
+		return result;
 	},
 	// Direct-parenting probe: a parent HMD roll rotates the fixed child axis.
 	headTiltProbe: function (degrees) {

@@ -39,30 +39,37 @@ All three requests should return `200`. The WASM response should use
 1. Open the demo in a WebXR-capable headset browser and choose **Enter VR**.
 2. Choose a starting GrappleMap position and either the red or blue grappler.
    No body trackers are active during setup.
-3. Move and turn your head to position yourself. Whenever the setup panel
-   recenters, the grappler stage recenters with it.
-4. Adjust scene distance, manual floor height, or tracker stiffness if needed.
+3. The setup panel and grappler stage are placed once when VR opens. Looking
+   away does not move or rotate either one. Use **Turn left** and **Turn right**
+   to rotate both grapplers and the mat together until the controlled grappler
+   is aligned with your real body.
+4. To move only the UI, point at its blue upper corner, hold trigger, and point
+   around yourself. The panel orbits at a constant distance and keeps facing
+   you; release trigger to leave it in place.
+5. Adjust scene distance, manual floor height, or tracker stiffness if needed.
    Point at a panel control and press any controller button to activate it.
-5. Point away from the panel and press either trigger once. This locks the
+6. Point away from the panel and press either trigger once. This locks the
    setup placement, snaps the head and both hands to the headset/controllers,
    and hides the controlled grappler's tracker-box visuals.
-6. Release the starting trigger. After that, hold a controller trigger to
+7. Release the starting trigger. After that, hold a controller trigger to
    clutch that side from the hand to the foot; release it to return to the
    hand.
 
 At the initial tracking moment, head and hand trackers snap directly onto the
-headset and controllers. A foot clutch instead captures the foot's existing
-position and orientation relative to that controller. Controller translation
-then moves the ankle without controller rotation orbiting it, while rotation
-aims the toe around the pinned ankle and does not pull on the heel/whole leg.
+headset and controllers. A foot clutch instead creates a temporary pivot at
+the foot's existing world position and orientation, then parents the foot to
+that pivot without changing its pose. Controller translation and rotation
+deltas drive the pivot from the capture pose, so controller rotation cannot
+orbit the ankle around the hand. Foot rotation aims the toe around the pinned
+ankle and does not pull on the heel/whole leg.
 The solver reads all tracker world poses in stage coordinates.
 
 The floating panel also provides **Floor -5 cm**, **Floor +5 cm**, **Reset
 pose**, and **Release trackers**. Releasing trackers returns to setup; the next
-off-panel trigger press resumes tracking with a fresh one-time snap. Before
-tracking starts, the setup menu and grappler stage recenter together when the
-headset turns more than 30 degrees away. After tracking starts, both stay
-locked in the play space.
+off-panel trigger press resumes tracking with a fresh one-time snap. The setup
+menu and grappler stage remain fixed after their initial placement, both before
+and after tracking starts. Scene turn, distance, and floor height also lock when
+tracking starts.
 
 ## Headset access and port forwarding
 

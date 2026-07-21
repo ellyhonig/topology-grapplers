@@ -60,13 +60,16 @@ or hand tracking, with the active gizmo parented directly to its XR transform.
 The body follows
 under gravity, muscle tone, and anatomy limits. Positions
 are loaded from the top-level `GrappleMap.txt`. In VR, choose whether to drive
-the red or blue grappler, position the shared menu/grappler stage, adjust the
-manual floor height if needed, then press either trigger once to start tracking.
+the red or blue grappler, position and turn the shared menu/grappler stage,
+adjust the manual floor height if needed, then press either trigger once to
+start tracking.
 The first press snaps the hands and head to the XR hardware and hides the
-tracker visuals. Foot clutching preserves the foot's offset and orientation and
-uses rotation only around the ankle. The floating panel accepts any controller
-button and includes pose reset, tracker release, stiffness, floor-height, and
-scene-distance controls.
+tracker visuals. Foot clutching creates a temporary pivot at the current foot
+pose, preserving its position and orientation while controller pose deltas move
+that pivot. Hold trigger on the floating panel's blue corner to orbit the UI
+around the headset without moving the grappler stage. The panel accepts any
+controller button and includes pose reset, tracker release, stiffness,
+floor-height, and scene-distance/turn controls.
 
 **Live build:** https://grapplemap-solver-vr.web.app
 
