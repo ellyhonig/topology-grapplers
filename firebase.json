@@ -5,7 +5,18 @@
       "firebase.json",
       "**/.*",
       "**/node_modules/**",
-      "solver/target/**"
+      "solver/target/**",
+      "start-steamvr-*.bat"
+    ],
+    "headers": [
+      {
+        "source": "/src/solver-demo.html",
+        "headers": [{ "key": "Cache-Control", "value": "no-cache" }]
+      },
+      {
+        "source": "/src/solver-demo/**",
+        "headers": [{ "key": "Cache-Control", "value": "no-cache" }]
+      }
     ]
   }
 }

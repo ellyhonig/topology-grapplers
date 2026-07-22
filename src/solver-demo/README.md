@@ -6,6 +6,10 @@ solver with mouse gizmos or WebXR input. The repository includes the compiled
 
 ## Run locally
 
+On Windows, start SteamVR and double-click `start-steamvr-demo.bat`. This starts
+the local tracker bridge and correctly rooted static server together, then
+opens `http://localhost:8766/src/solver-demo.html`.
+
 Start the static server from the repository root:
 
 ```sh
@@ -36,6 +40,20 @@ All three requests should return `200`. The WASM response should use
 
 ## VR controls
 
+Chromium does not expose generic SteamVR trackers through WebXR. The included
+loopback bridge supplies their poses separately:
+
+```sh
+python -m pip install openvr cryptography
+python scripts/steamvr_tracker_bridge.py
+```
+
+Use `start-steamvr-firebase.bat` to start the bridge and open the hosted site in
+one step. Local pages connect to `ws://127.0.0.1:17373`; the HTTPS Firebase page
+uses `wss://127.0.0.1:17374`. On first run, the bridge creates and trusts a
+GrappleMap-only localhost server certificate for the current Windows user.
+Both listeners remain loopback-only. Allow Chrome's Local Network Access prompt.
+
 1. Open the demo in a WebXR-capable headset browser and choose **Enter VR**.
 2. Choose a starting GrappleMap position and either the red or blue grappler.
    No body trackers are active during setup.
@@ -51,9 +69,9 @@ All three requests should return `200`. The WASM response should use
 6. Point away from the panel and press either trigger once. This locks the
    setup placement, snaps the head and both hands to the headset/controllers,
    and hides the controlled grappler's tracker-box visuals.
-7. Release the starting trigger. After that, hold a controller trigger to
-   clutch that side from the hand to the foot; release it to return to the
-   hand.
+7. With two SteamVR trackers connected, they are assigned to the feet and both
+   controllers remain on the hands. Without them, release the starting trigger,
+   then hold a controller trigger to clutch that side from hand to foot.
 
 At the initial tracking moment, head and hand trackers snap directly onto the
 headset and controllers. A foot clutch instead creates a temporary pivot at

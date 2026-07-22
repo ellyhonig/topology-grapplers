@@ -6,8 +6,8 @@
 	<title>GrappleMap Rust Solver Demo</title>
 	<link rel="stylesheet" href="topology-demo.css">
 	<link rel="stylesheet" href="solver-demo/solver-demo.css">
-	<script src="https://cdn.babylonjs.com/babylon.js"></script>
-	<script src="https://cdn.babylonjs.com/gui/babylon.gui.min.js"></script>
+	<script src="solver-demo/vendor/babylon.js"></script>
+	<script src="solver-demo/vendor/babylon.gui.min.js"></script>
 	<script src="gm.js"></script>
 </head>
 <body>
@@ -30,12 +30,14 @@
 		<aside class="controls">
 			<header>
 				<h1>Rust XPBD Solver</h1>
-				<p>Each grappler carries five 6-DOF trackers - hands, feet, and head. Mouse gizmos still work, or enter VR to drive either grappler in third person with a headset and two controllers.</p>
+				<p>Each grappler carries five 6-DOF trackers - hands, feet, and head. Mouse gizmos still work, or enter VR to drive either grappler with a headset, two controllers, and optional SteamVR foot trackers.</p>
 			</header>
 
 			<section class="vr-card">
 				<h2>VR controls</h2>
 				<p>Enter VR, choose a pose, turn the whole scene to line up with the controlled grappler, and position yourself before tracking. Point away from the menu and press either trigger once to snap on tracking; after releasing it, a trigger hold clutches that controller from the hand to the foot without snapping the foot.</p>
+				<p>For dedicated feet, run <code>start-steamvr-demo.bat</code> locally or <code>start-steamvr-firebase.bat</code> with this hosted page. When two SteamVR trackers are found they drive the feet automatically, while controllers stay on the hands. Allow the browser's Local Network Access prompt.</p>
+				<p class="hint"><code>python -m pip install openvr cryptography</code><br><code>python scripts/steamvr_tracker_bridge.py</code></p>
 				<label class="field">
 					<span>VR-controlled grappler</span>
 					<select id="vrPlayerSelect">
@@ -83,6 +85,6 @@
 			</section>
 		</aside>
 	</main>
-	<script type="module" src="solver-demo/main.js?v=vr-menu-orbit-1"></script>
+	<script type="module" src="solver-demo/main.js?v=firstperson-steamvr-1"></script>
 </body>
 </html>

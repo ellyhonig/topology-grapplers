@@ -64,7 +64,9 @@ the red or blue grappler, position and turn the shared menu/grappler stage,
 adjust the manual floor height if needed, then press either trigger once to
 start tracking.
 The first press snaps the hands and head to the XR hardware and hides the
-tracker visuals. Foot clutching creates a temporary pivot at the current foot
+tracker visuals. When the loopback SteamVR bridge detects two generic trackers,
+it assigns them left/right and keeps both controllers on the hands. Without
+dedicated trackers, foot clutching creates a temporary pivot at the current foot
 pose, preserving its position and orientation while controller pose deltas move
 that pivot. Hold trigger on the floating panel's blue corner to orbit the UI
 around the headset without moving the grappler stage. The panel accepts any
@@ -73,7 +75,16 @@ floor-height, and scene-distance/turn controls.
 
 **Live build:** https://grapplemap-solver-vr.web.app
 
+On Windows, double-click `start-steamvr-firebase.bat` to start the secure
+loopback bridge and open the live build. Its first run creates and trusts a
+GrappleMap-only localhost server certificate for the current Windows user, so
+the HTTPS Firebase page can connect without mixed-content blocking.
+
 ### Running it locally
+
+Start SteamVR, make it the active OpenXR runtime, and double-click
+`start-steamvr-demo.bat`. It starts both the tracker bridge and a correctly
+rooted local server at `http://localhost:8766/src/solver-demo.html`.
 
 The page is fully client-side but has two path requirements: assets resolve
 relative to `src/`, and the page fetches `../GrappleMap.txt` (the database at the
@@ -84,8 +95,9 @@ python -m http.server 8000      # from the repo root
 # then open http://localhost:8000/src/solver-demo.html
 ```
 
-Babylon.js is loaded from a CDN, so an internet connection is needed. The
-`.wasm` module must be served with `Content-Type: application/wasm`.
+Babylon.js and Babylon GUI are vendored under `src/solver-demo/vendor`, so the
+local demo does not depend on a CDN. The `.wasm` module must be served with
+`Content-Type: application/wasm`.
 
 ### VR requires HTTPS
 
