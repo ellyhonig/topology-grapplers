@@ -1,0 +1,9 @@
+# wasm-pack generates this directory with a catch-all ignore rule. The solver
+# demo is intentionally self-contained, so keep its web package in Git.
+*
+!.gitignore
+!gm_wasm.js
+!gm_wasm_bg.wasm
+!gm_wasm.d.ts
+!gm_wasm_bg.wasm.d.ts
+!package.json

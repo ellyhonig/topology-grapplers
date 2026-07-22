@@ -1,0 +1,16 @@
+[package]
+name = "gm-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+gm-core = { workspace = true }
+gm-collision = { workspace = true }
+gm-solver = { workspace = true }
+gm-topology = { workspace = true }
+gm-validate = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

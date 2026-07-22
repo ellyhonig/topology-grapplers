@@ -1,0 +1,11 @@
+[package]
+name = "gm-validate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gm-core = { workspace = true }
+gm-collision = { workspace = true }
+gm-solver = { workspace = true }
+serde = { workspace = true }
