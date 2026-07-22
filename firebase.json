@@ -5,7 +5,8 @@
       "firebase.json",
       "**/.*",
       "**/node_modules/**",
-      "solver/target/**"
+      "solver/target/**",
+      "start-steamvr-demo.bat"
     ],
     "headers": [
       {
