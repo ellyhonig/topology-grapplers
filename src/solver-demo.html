@@ -6,8 +6,8 @@
 	<title>GrappleMap Rust Solver Demo</title>
 	<link rel="stylesheet" href="topology-demo.css">
 	<link rel="stylesheet" href="solver-demo/solver-demo.css">
-	<script src="https://cdn.babylonjs.com/babylon.js"></script>
-	<script src="https://cdn.babylonjs.com/gui/babylon.gui.min.js"></script>
+	<script src="solver-demo/vendor/babylon.js"></script>
+	<script src="solver-demo/vendor/babylon.gui.min.js"></script>
 	<script src="gm.js"></script>
 </head>
 <body>
@@ -35,7 +35,8 @@
 
 			<section class="vr-card">
 				<h2>VR controls</h2>
-				<p>Connect two trackers in SteamVR, enter VR, choose a pose, and position yourself with one tracker on each foot. Point away from the menu and press either controller trigger once to calibrate and start. The lower unhanded SteamVR devices are assigned left/right from their positions at that moment; controllers remain on the hands.</p>
+				<p>For local Windows use, start SteamVR and run <code>start-steamvr-demo.bat</code>. For the hosted page, <a href="../scripts/steamvr_tracker_bridge.py" download>download and start the tracker bridge</a> on the SteamVR PC and allow the browser's Local Network Access prompt. Connect two trackers, enter VR, choose a pose, and position yourself with one tracker on each foot. Point away from the menu and press either controller trigger once to calibrate and start. The two lowest generic SteamVR devices are assigned left/right from their positions at that moment; controllers remain on the hands.</p>
+				<p class="hint"><code>python -m pip install openvr</code><br><code>python scripts/steamvr_tracker_bridge.py --serve</code></p>
 				<label class="field">
 					<span>VR-controlled grappler</span>
 					<select id="vrPlayerSelect">
@@ -79,6 +80,6 @@
 			</section>
 		</aside>
 	</main>
-	<script type="module" src="solver-demo/main.js"></script>
+	<script type="module" src="solver-demo/main.js?v=steamvr-local-2"></script>
 </body>
 </html>

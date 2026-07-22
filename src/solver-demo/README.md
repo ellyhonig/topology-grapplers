@@ -6,7 +6,23 @@ solver with mouse gizmos or WebXR input. The repository includes the compiled
 
 ## Run locally
 
-Start the static server from the repository root:
+On Windows, start SteamVR and double-click `start-steamvr-demo.bat` in the
+repository root. This starts the correctly rooted local web server and the
+SteamVR tracker bridge together, then opens the demo in your default browser.
+Leave the console window open while using VR.
+
+The equivalent command is:
+
+```sh
+python scripts/steamvr_tracker_bridge.py --serve
+```
+
+Make sure SteamVR is selected as the current OpenXR runtime under SteamVR's
+OpenXR settings. The page reports a timeout with a recovery hint if the runtime
+does not answer instead of staying on `checking...` forever.
+
+To run only the desktop demo without the tracker bridge, start the static
+server from the repository root:
 
 ```sh
 python3 -m http.server 8765
@@ -36,8 +52,22 @@ All three requests should return `200`. The WASM response should use
 
 ## VR controls
 
-1. Connect and track two foot trackers in SteamVR, then open the demo in a
-   WebXR-capable headset browser and choose **Enter VR**.
+Chrome's OpenXR-backed WebXR implementation exposes the headset and supported
+hand controllers, but not SteamVR's generic tracker class. Start the small local
+pose bridge on the same Windows PC as SteamVR before opening the hosted demo:
+
+```sh
+python -m pip install openvr
+python scripts/steamvr_tracker_bridge.py
+```
+
+The bridge listens only on `127.0.0.1:17373`; it does not expose tracker data to
+the network. Allow the hosted page's **Local Network Access** prompt so Chrome
+can reach that loopback port. To test the browser integration without physical
+trackers, run the bridge with `--simulate`.
+
+1. Start the tracker bridge, connect and track two foot trackers in SteamVR,
+   then open the demo in a WebXR-capable headset browser and choose **Enter VR**.
 2. Choose a starting GrappleMap position and either the red or blue grappler.
    No body trackers are active during setup.
 3. Move and turn your head to position yourself. Whenever the setup panel
@@ -66,13 +96,12 @@ tracking starts, the setup menu and grappler stage recenter together when the
 headset turns more than 30 degrees away. After tracking starts, both stay
 locked in the play space.
 
-SteamVR tracker discovery uses unhanded WebXR input sources that expose a
-tracked pointer or grip space. Discovery is reconciled while the session is
-running, since some runtimes finish creating a tracker's pose node after first
-announcing the source. If the status does not reach `2/2 feet found`, confirm
-both trackers are powered, tracked, and exposed to the browser's WebXR session.
-When more than two unhanded tracked devices are exposed, the two lowest devices
-at calibration are used.
+SteamVR tracker discovery uses generic-device poses from the loopback bridge,
+with unhanded WebXR input sources retained as a compatibility fallback. If the
+status reports that the bridge is offline, start the script on the browser PC.
+If it connects but does not reach `2/2 feet found`, confirm both trackers are
+powered and tracking in SteamVR. When more than two generic tracked devices are
+present, the two lowest devices at calibration are used.
 
 ## Headset access and port forwarding
 
@@ -124,6 +153,6 @@ to work.
 
 ### Babylon or the GUI does not load
 
-The demo loads Babylon.js and Babylon GUI from `cdn.babylonjs.com`. The browser
-therefore needs outbound internet access unless those scripts are vendored
-locally in a future change.
+The demo includes local copies under `solver-demo/vendor`. Confirm both
+`babylon.js` and `babylon.gui.min.js` return HTTP 200; no CDN connection is
+required.
