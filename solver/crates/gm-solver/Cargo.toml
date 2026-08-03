@@ -1,0 +1,11 @@
+[package]
+name = "gm-solver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gm-core = { workspace = true }
+gm-collision = { workspace = true }
+gm-topology = { workspace = true }
+serde = { workspace = true }

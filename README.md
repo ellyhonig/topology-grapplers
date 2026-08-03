@@ -47,6 +47,67 @@ In addition, there is:
 
   [![diff](http://eel.is/GrappleMap-extra/diff-small.png)](http://eel.is/GrappleMap-extra/diff-big.png)
 
+## Rust Solver Demo (WebXR)
+
+`src/solver-demo.html` is a browser demo that renders two grapplers with
+[Babylon.js](https://www.babylonjs.com/) and drives their bodies through a Rust
+XPBD constraint solver compiled to WebAssembly (`src/solver-demo/pkg/`, built
+with `wasm-pack`). Its editable Rust workspace, including muscle-tone and
+constraint code, is in `solver/`. Each grappler carries five 6-DOF trackers —
+hands, feet, and head, like a VR tracker rig. On desktop you engage a tracker
+and move it with the gizmo; in a headset the trackers follow your controllers
+or hand tracking, with the active gizmo parented directly to its XR transform.
+The body follows
+under gravity, muscle tone, and anatomy limits. Positions
+are loaded from the top-level `GrappleMap.txt`. In VR, choose whether to drive
+the red or blue grappler, position and turn the shared menu/grappler stage,
+adjust the manual floor height if needed, then press either trigger once to
+start tracking.
+The first press snaps the hands and head to the XR hardware and hides the
+tracker visuals. When the loopback SteamVR bridge detects two generic trackers,
+it assigns them left/right and keeps both controllers on the hands. Without
+dedicated trackers, foot clutching creates a temporary pivot at the current foot
+pose, preserving its position and orientation while controller pose deltas move
+that pivot. Hold trigger on the floating panel's blue corner to orbit the UI
+around the headset without moving the grappler stage. The panel accepts any
+controller button and includes pose reset, tracker release, stiffness,
+floor-height, and scene-distance/turn controls.
+
+**Live build:** https://grapplemap-solver-vr.web.app
+
+On Windows, double-click `start-steamvr-firebase.bat` to start the secure
+loopback bridge and open the live build. Its first run creates and trusts a
+GrappleMap-only localhost server certificate for the current Windows user, so
+the HTTPS Firebase page can connect without mixed-content blocking.
+
+### Running it locally
+
+Start SteamVR, make it the active OpenXR runtime, and double-click
+`start-steamvr-demo.bat`. It starts both the tracker bridge and a correctly
+rooted local server at `http://localhost:8766/src/solver-demo.html`.
+
+The page is fully client-side but has two path requirements: assets resolve
+relative to `src/`, and the page fetches `../GrappleMap.txt` (the database at the
+repo root). Serve the **repo root** and open the page under `/src/`:
+
+```sh
+python -m http.server 8000      # from the repo root
+# then open http://localhost:8000/src/solver-demo.html
+```
+
+Babylon.js and Babylon GUI are vendored under `src/solver-demo/vendor`, so the
+local demo does not depend on a CDN. The `.wasm` module must be served with
+`Content-Type: application/wasm`.
+
+### VR requires HTTPS
+
+WebXR immersive sessions only run in a [secure
+context](https://developer.mozilla.org/docs/Web/Security/Secure_Contexts):
+`https://` or `localhost`. Loading the page over a plain-HTTP LAN/public IP
+(e.g. `http://192.168.x.x:8080`) lets the desktop 3D scene render but silently
+blocks "Open in VR". Use the HTTPS build above (or any HTTPS host) from the
+headset.
+
 ## FAQ
 
 ### Which grappling techniques are included?

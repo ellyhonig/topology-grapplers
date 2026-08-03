@@ -1,0 +1,23 @@
+@echo off
+setlocal
+cd /d "%~dp0"
+where python >nul 2>nul
+if errorlevel 1 (
+  echo Python was not found. Install Python 3 and try again.
+  pause
+  exit /b 1
+)
+python -c "import openvr, cryptography" >nul 2>nul
+if errorlevel 1 (
+  echo Installing the SteamVR Python bridge dependencies...
+  python -m pip install openvr cryptography
+  if errorlevel 1 (
+    echo Could not install bridge dependencies.
+    pause
+    exit /b 1
+  )
+)
+echo Start SteamVR and make sure SteamVR is the active OpenXR runtime.
+echo This window must remain open while you use the demo.
+python scripts\steamvr_tracker_bridge.py --serve
+if errorlevel 1 pause

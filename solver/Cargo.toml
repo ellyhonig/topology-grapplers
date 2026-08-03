@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gm-core",
+    "crates/gm-solver",
+    "crates/gm-collision",
+    "crates/gm-topology",
+    "crates/gm-validate",
+    "crates/gm-wasm",
+    "crates/gm-unity",
+    "tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+
+[workspace.dependencies]
+gm-core = { path = "crates/gm-core" }
+gm-solver = { path = "crates/gm-solver" }
+gm-collision = { path = "crates/gm-collision" }
+gm-topology = { path = "crates/gm-topology" }
+gm-validate = { path = "crates/gm-validate" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+proptest = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
