@@ -36,6 +36,30 @@ pub struct SolverState {
     /// broken bit is set - a smooth "letting go" instead of a hard constraint
     /// vanishing mid-frame (which snaps the stretched limb back in one frame).
     pub grip_release: [f64; 32],
+    /// Solver-owned acquisition progress for live hand grips. Zero is the
+    /// captured hand shape; one is the full contact-following curl.
+    pub grip_wrap: [f64; 32],
+    /// Fraction of the two live hand points that have made sticky contact.
+    /// Unlike the old dwell value this is monotonic for the life of a grip:
+    /// once a hand/finger point touches, it stays latched until explicit
+    /// release.
+    pub grip_contact: [f64; 32],
+    /// Fraction of the solver-selected wrist-to-finger curl that the hand
+    /// actually achieved around the target capsule.
+    pub grip_coverage: [f64; 32],
+    /// Binary live grip strength. Any captured contact point makes the runtime
+    /// grip full strength; wrap coverage never scales holding force.
+    pub grip_strength: [f64; 32],
+    /// Bit 0 is the hand contact and bit 1 is the finger contact.
+    pub grip_contact_bits: [u8; 32],
+    /// Material anchors for sticky runtime contacts. `s` locates the point
+    /// along the target capsule's segment; the radial offset follows changes
+    /// in the segment axis so the contact point moves with the grabbed limb.
+    pub grip_anchor_axis: [V3; 32],
+    pub grip_hand_anchor_s: [f64; 32],
+    pub grip_hand_anchor_radial: [V3; 32],
+    pub grip_finger_anchor_s: [f64; 32],
+    pub grip_finger_anchor_radial: [V3; 32],
 }
 
 impl SolverState {
@@ -51,6 +75,16 @@ impl SolverState {
             broken_grips: 0,
             grip_strain: [0.0; 32],
             grip_release: [0.0; 32],
+            grip_wrap: [0.0; 32],
+            grip_contact: [0.0; 32],
+            grip_coverage: [0.0; 32],
+            grip_strength: [0.0; 32],
+            grip_contact_bits: [0; 32],
+            grip_anchor_axis: [V3::ZERO; 32],
+            grip_hand_anchor_s: [0.0; 32],
+            grip_hand_anchor_radial: [V3::ZERO; 32],
+            grip_finger_anchor_s: [0.0; 32],
+            grip_finger_anchor_radial: [V3::ZERO; 32],
         };
         crate::anatomy_constraints::refresh_bend_memory(&mut state);
         state

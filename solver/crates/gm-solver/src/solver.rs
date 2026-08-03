@@ -147,6 +147,58 @@ struct Grip {
     cap: usize,
     /// Captured joint-to-segment distance (the tether length).
     len: f64,
+    /// Runtime grips are explicitly held by controller input. Unlike authored
+    /// pose grips, an effector on the gripping hand must not suspend them.
+    runtime: bool,
+    wrist: Option<PlayerJoint>,
+    /// The finger centroid is a second contact point for live hand grips. It
+    /// lets the solver form an actual hook around a limb instead of reducing a
+    /// hand to one tethered particle.
+    finger: Option<PlayerJoint>,
+    finger_len: f64,
+    /// Solver-selected maximum-writhe continuation around the target capsule.
+    hand_wrap: f64,
+    target_wrap: f64,
+    selected_writhe: f64,
+    alternate_writhe: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GripCandidate {
+    pub capsule: usize,
+    pub player: PlayerId,
+    pub ends: [Joint; 2],
+    pub closest: V3,
+    pub surface_gap: f64,
+    pub palm_alignment: f64,
+    pub wrap_alignment: f64,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeGripState {
+    pub active: bool,
+    pub broken: bool,
+    pub capsule: usize,
+    pub player: PlayerId,
+    pub ends: [Joint; 2],
+    pub strain: f64,
+    pub release: f64,
+    pub wrap: f64,
+    pub contact: f64,
+    pub coverage: f64,
+    pub strength: f64,
+    pub direction: f64,
+    pub selected_writhe: f64,
+    pub alternate_writhe: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeWrapPlan {
+    hand_wrap: f64,
+    finger_wrap: f64,
+    selected_writhe: f64,
+    alternate_writhe: f64,
 }
 
 /// Joints that can grip: hands grasp, feet hook.
@@ -177,6 +229,24 @@ const GRIP_CONTACT: f64 = 0.04;
 /// joint has genuinely tried to let go.
 const GRIP_SLACK: f64 = 0.03;
 
+/// Controller-held runtime grips should engage almost immediately. Authored
+/// pose grips keep the larger slack above to avoid competing contact/tether
+/// constraints, but a live grab needs to feel attached to the palm.
+const RUNTIME_GRIP_SLACK: f64 = 0.005;
+
+/// Live acquisition is a short constraint-guided curl, not an instantaneous
+/// teleport. The hand/finger pair closes toward the capsule surface while
+/// contact, bones, anatomy, and the topology watchdog remain authoritative.
+const RUNTIME_WRAP_RATE: f64 = 8.0;
+const RUNTIME_WRAP_SPEED: f64 = 1.25;
+/// A wrap point becomes a permanent suction-cup-style anchor once it is this
+/// close to the target surface. The wrap target itself carries 5 mm of slack,
+/// so 8 mm reliably captures contact without latching a merely nearby point.
+const RUNTIME_STICKY_CAPTURE_GAP: f64 = 0.008;
+const RUNTIME_WRAP_ABORT_GAP: f64 = 0.10;
+const RUNTIME_WRAP_MIN_STEP_ANGLE: f64 = 28.0 * std::f64::consts::PI / 180.0;
+const RUNTIME_WRAP_MAX_STEP_ANGLE: f64 = 72.0 * std::f64::consts::PI / 180.0;
+
 /// Grips have finite strength against *deliberate* pulls. While the gripped
 /// limb is user-driven, each substep's attempted stretch beyond the tether
 /// length (meters) is added to a leaky per-grip strain accumulator; past this
@@ -184,6 +254,10 @@ const GRIP_SLACK: f64 = 0.03;
 /// plateaus above 0.4 and crosses this in well under a second; incidental
 /// brushes of the effector against the tether stay below it.
 const GRIP_STRENGTH: f64 = 0.3;
+
+/// Live controller grips are binary: zero before a contact point is captured,
+/// maximum strength afterward.
+pub const RUNTIME_GRIP_STRENGTH: f64 = 1.0;
 
 /// Decay rate (1/s) of the grip strain accumulator: brief tugs are forgiven,
 /// sustained ones are not.
@@ -253,6 +327,14 @@ fn capture_grips(pose: &Pose, caps: &[CapsuleDef]) -> Vec<Grip> {
                         joint: pj,
                         cap: ci,
                         len: p.distance(anchor) + GRIP_SLACK,
+                        runtime: false,
+                        wrist: None,
+                        finger: None,
+                        finger_len: 0.0,
+                        hand_wrap: 0.0,
+                        target_wrap: 0.0,
+                        selected_writhe: 0.0,
+                        alternate_writhe: 0.0,
                     });
                 }
             }
@@ -342,7 +424,7 @@ fn grip_mask(grips: &[Grip], effectors: &[Effector], broken: u32) -> Vec<bool> {
             if broken & (1 << i) != 0 {
                 return false;
             }
-            !effectors.iter().any(|e| {
+            g.runtime || !effectors.iter().any(|e| {
                 e.joint.player == g.joint.player
                     && LIMB_GROUPS.iter().any(|(group, _)| {
                         group.contains(&g.joint.joint) && group.contains(&e.joint.joint)
@@ -364,13 +446,20 @@ fn grip_strainable(grips: &[Grip], caps: &[CapsuleDef], effectors: &[Effector]) 
         .iter()
         .map(|g| {
             let cap = &caps[g.cap];
-            effectors.iter().any(|e| {
+            let target_driven = effectors.iter().any(|e| {
                 e.joint.player == cap.player
                     && LIMB_GROUPS.iter().any(|(group, root)| {
                         let in_group = |j: Joint| group.contains(&j) || *root == Some(j);
                         in_group(e.joint.joint) && cap.ends.iter().any(|&end| in_group(end))
                     })
-            })
+            });
+            let source_driven = g.runtime && effectors.iter().any(|e| {
+                e.joint.player == g.joint.player
+                    && LIMB_GROUPS.iter().any(|(group, _)| {
+                        group.contains(&g.joint.joint) && group.contains(&e.joint.joint)
+                    })
+            });
+            target_driven || source_driven
         })
         .collect()
 }
@@ -541,6 +630,173 @@ mod tone_scale_tests {
     }
 }
 
+#[cfg(test)]
+mod runtime_wrap_tests {
+    use super::*;
+    use gm_core::{P0, P1};
+
+    fn fixture() -> (Solver, SolverState, PlayerJoint, usize) {
+        let mut pose = Pose::default();
+        for pj in PlayerJoint::all() {
+            let n = pj.flat() as f64;
+            pose[pj] = v3(20.0 + n * 2.0, 5.0 + n * 0.1, 30.0);
+        }
+        pose.set(P1, Joint::LeftShoulder, v3(0.0, 0.0, 0.0));
+        pose.set(P1, Joint::LeftElbow, v3(0.0, 1.0, 0.0));
+        let solver = Solver::new(&pose, SolverConfig::default());
+        let mut state = SolverState::from_pose(pose);
+        let hand = PlayerJoint { player: P0, joint: Joint::LeftHand };
+        let wrist = PlayerJoint { player: P0, joint: Joint::LeftWrist };
+        let finger = PlayerJoint { player: P0, joint: Joint::LeftFingers };
+        let radius = 0.070;
+        let angle = 25.0f64.to_radians();
+        state.pose[wrist] = v3(0.09, 0.5, 0.02);
+        state.pose[hand] = v3(radius, 0.5, 0.0);
+        state.pose[finger] = v3(radius * angle.cos(), 0.575, -radius * angle.sin());
+        let capsule = solver
+            .capsules()
+            .iter()
+            .position(|cap| {
+                cap.player == P1
+                    && cap.ends == [Joint::LeftShoulder, Joint::LeftElbow]
+            })
+            .unwrap();
+        (solver, state, hand, capsule)
+    }
+
+    #[test]
+    fn wrist_contact_authorizes_a_floppy_hand_without_palm_aim() {
+        let (solver, mut state, hand, capsule) = fixture();
+        let (_, finger) = Solver::hand_chain(hand).unwrap();
+        state.pose[hand] += v3(0.18, 0.0, 0.0);
+        state.pose[finger] += v3(0.24, 0.0, 0.0);
+        let candidate = solver
+            .query_grip_candidate(
+                &state,
+                hand,
+                state.pose[hand],
+                v3(1.0, 0.0, 0.0),
+                0.04,
+                0.2,
+            )
+            .expect("wrist contact should authorize a solver wrap");
+        assert_eq!(candidate.capsule, capsule);
+        assert!(candidate.surface_gap < 0.04);
+    }
+
+    #[test]
+    fn maximum_writhe_wrap_is_dramatic_local_and_captures_full_strength_anchors() {
+        let (mut solver, mut state, hand, capsule) = fixture();
+        assert!(solver.begin_runtime_grip(&mut state, hand, capsule, 0.04));
+        let index = solver.grip_count() - 1;
+        let wrist = solver.grips[index].wrist.unwrap();
+        let finger = solver.grips[index].finger.unwrap();
+        assert!(
+            solver.grips[index].selected_writhe + 1e-9
+                >= solver.grips[index].alternate_writhe,
+            "solver did not choose the maximum-writhe direction",
+        );
+        let initial = Solver::signed_wrap_angle(
+            &state.pose,
+            &solver.caps[capsule],
+            state.pose[wrist],
+            state.pose[finger],
+        )
+        .abs();
+        let wrist_before = state.pose[wrist];
+        let cap_a = solver.caps[capsule].a();
+        let cap_b = solver.caps[capsule].b();
+        let cap_a_before = state.pose[cap_a];
+        let cap_b_before = state.pose[cap_b];
+        let hand_before = state.pose[hand];
+        let finger_before = state.pose[finger];
+        let active = vec![true; solver.grip_count()];
+        for step in 1..=40 {
+            state.grip_wrap[index] = step as f64 / 40.0;
+            solver.project_runtime_wraps(
+                &mut state.pose,
+                &active,
+                &state.grip_wrap,
+                &state.grip_contact_bits,
+                1.0 / 120.0,
+            );
+        }
+        let curled = Solver::signed_wrap_angle(
+            &state.pose,
+            &solver.caps[capsule],
+            state.pose[wrist],
+            state.pose[finger],
+        )
+        .abs();
+        assert!(
+            curled > initial + 45.0f64.to_radians(),
+            "wrap was not visually dramatic: {} -> {} degrees",
+            initial.to_degrees(),
+            curled.to_degrees(),
+        );
+        assert_eq!(state.pose[wrist], wrist_before, "acquisition moved the tracked wrist");
+        assert_eq!(state.pose[cap_a], cap_a_before, "acquisition moved the target capsule");
+        assert_eq!(state.pose[cap_b], cap_b_before, "acquisition moved the target capsule");
+        assert!(state.pose[hand].distance(hand_before) > 0.01);
+        assert!(state.pose[finger].distance(finger_before) > 0.05);
+
+        let mut active = active;
+        solver.update_runtime_grip_quality(&mut state, 0.02, &mut active);
+        assert!(state.grip_coverage[index] > 0.65);
+        assert_eq!(state.grip_contact_bits[index], 0b11);
+        assert_eq!(state.grip_contact[index], 1.0);
+        assert_eq!(state.grip_strength[index], RUNTIME_GRIP_STRENGTH);
+        assert!(solver.runtime_grip_state(&state, hand).unwrap().active);
+
+        // Proof that these are fixed material contact points rather than the
+        // previous sliding capsule tethers: pull both captured points far
+        // away, project once, and verify they return to their stored axial and
+        // radial anchors at full stiffness.
+        state.pose[hand] += v3(0.20, 0.12, 0.08);
+        state.pose[finger] += v3(-0.16, 0.15, 0.10);
+        for _ in 0..200 {
+            solver.project_grips(
+                &mut state.pose,
+                &active,
+                &state.grip_release,
+                &state.grip_contact_bits,
+                &state.grip_hand_anchor_s,
+                &state.grip_hand_anchor_radial,
+                &state.grip_finger_anchor_s,
+                &state.grip_finger_anchor_radial,
+                &|_| 1.0,
+            );
+        }
+        let hand_anchor = state.pose[cap_a] * (1.0 - state.grip_hand_anchor_s[index])
+            + state.pose[cap_b] * state.grip_hand_anchor_s[index]
+            + state.grip_hand_anchor_radial[index];
+        let finger_anchor = state.pose[cap_a] * (1.0 - state.grip_finger_anchor_s[index])
+            + state.pose[cap_b] * state.grip_finger_anchor_s[index]
+            + state.grip_finger_anchor_radial[index];
+        let hand_error = state.pose[hand].distance(hand_anchor);
+        let finger_error = state.pose[finger].distance(finger_anchor);
+        assert!(hand_error < 0.002, "sticky hand anchor error {hand_error}");
+        assert!(finger_error < 0.002, "sticky finger anchor error {finger_error}");
+
+        // A shallow wrap receives the exact same full holding strength as a
+        // dramatic one as soon as it makes contact.
+        let (mut shallow_solver, mut shallow, shallow_hand, shallow_capsule) = fixture();
+        assert!(shallow_solver.begin_runtime_grip(
+            &mut shallow, shallow_hand, shallow_capsule, 0.04));
+        let shallow_index = shallow_solver.grip_count() - 1;
+        let mut shallow_active = vec![true; shallow_solver.grip_count()];
+        shallow_solver.update_runtime_grip_quality(
+            &mut shallow, 0.02, &mut shallow_active);
+        assert!(shallow.grip_coverage[shallow_index] < state.grip_coverage[index]);
+        assert_ne!(shallow.grip_contact_bits[shallow_index], 0);
+        assert_eq!(
+            shallow.grip_strength[shallow_index],
+            state.grip_strength[index],
+            "wrap amount incorrectly scaled sticky grip strength",
+        );
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StepDiagnostics {
     /// Number of active contacts in the last substep.
@@ -634,6 +890,322 @@ impl Solver {
     /// players to disengage).
     pub fn release_grips(&mut self) {
         self.grips.clear();
+    }
+
+    fn hand_chain(hand: PlayerJoint) -> Option<(PlayerJoint, PlayerJoint)> {
+        let (wrist, finger) = match hand.joint {
+            Joint::LeftHand => (Joint::LeftWrist, Joint::LeftFingers),
+            Joint::RightHand => (Joint::RightWrist, Joint::RightFingers),
+            _ => return None,
+        };
+        Some((
+            PlayerJoint { player: hand.player, joint: wrist },
+            PlayerJoint { player: hand.player, joint: finger },
+        ))
+    }
+
+    fn radial_about_capsule(pose: &Pose, cap: &CapsuleDef, point: V3) -> Option<(V3, V3, f64)> {
+        let a = pose[cap.a()];
+        let b = pose[cap.b()];
+        let axis = (b - a).normalized(1e-9)?;
+        let (anchor, s) = gm_core::closest_point_on_segment(point, a, b);
+        Some(((point - anchor).normalized(1e-9)?, axis, s))
+    }
+
+    fn signed_wrap_angle(pose: &Pose, cap: &CapsuleDef, hand: V3, finger: V3) -> f64 {
+        let Some((hand_radial, axis, _)) = Self::radial_about_capsule(pose, cap, hand) else {
+            return 0.0;
+        };
+        let Some((finger_radial, _, _)) = Self::radial_about_capsule(pose, cap, finger) else {
+            return 0.0;
+        };
+        axis.dot(hand_radial.cross(finger_radial))
+            .atan2(hand_radial.dot(finger_radial))
+    }
+
+    fn rotate_radial(radial: V3, axis: V3, angle: f64) -> V3 {
+        let (sin, cos) = angle.sin_cos();
+        radial * cos + axis.cross(radial) * sin
+    }
+
+    fn wrap_step_angle(span: f64, surface_radius: f64) -> f64 {
+        (span / (2.0 * surface_radius).max(1e-9))
+            .clamp(0.0, 0.96)
+            .asin()
+            .mul_add(2.0 * 0.92, 0.0)
+            .clamp(RUNTIME_WRAP_MIN_STEP_ANGLE, RUNTIME_WRAP_MAX_STEP_ANGLE)
+    }
+
+    fn wrap_direction_score(
+        pose: &Pose,
+        cap: &CapsuleDef,
+        wrist: PlayerJoint,
+        hand: PlayerJoint,
+        finger: PlayerJoint,
+        hand_angle: f64,
+        finger_angle: f64,
+    ) -> Option<f64> {
+        let a = pose[cap.a()];
+        let b = pose[cap.b()];
+        let axis = (b - a).normalized(1e-9)?;
+        let (wrist_axis, _) = gm_core::closest_point_on_segment(pose[wrist], a, b);
+        let wrist_radial = (pose[wrist] - wrist_axis).normalized(1e-9)?;
+        let (hand_axis, _) = gm_core::closest_point_on_segment(pose[hand], a, b);
+        let (finger_axis, _) = gm_core::closest_point_on_segment(pose[finger], a, b);
+        let hand_target = hand_axis
+            + Self::rotate_radial(wrist_radial, axis, hand_angle)
+                * (cap.radius + hand.joint.radius() + RUNTIME_GRIP_SLACK);
+        let finger_target = finger_axis
+            + Self::rotate_radial(wrist_radial, axis, finger_angle)
+                * (cap.radius + finger.joint.radius() + RUNTIME_GRIP_SLACK);
+        let writhe =
+            gm_topology::segment_writhe(pose[wrist], hand_target, a, b)
+                + gm_topology::segment_writhe(hand_target, finger_target, a, b);
+        Some(writhe.abs())
+    }
+
+    fn plan_runtime_wrap(
+        pose: &Pose,
+        cap: &CapsuleDef,
+        wrist: PlayerJoint,
+        hand: PlayerJoint,
+        finger: PlayerJoint,
+    ) -> Option<RuntimeWrapPlan> {
+        let hand_span = pose[wrist].distance(pose[hand]);
+        let finger_span = pose[hand].distance(pose[finger]);
+        let hand_angle = Self::wrap_step_angle(
+            hand_span,
+            cap.radius + 0.5 * (wrist.joint.radius() + hand.joint.radius()),
+        );
+        let second_angle = Self::wrap_step_angle(
+            finger_span,
+            cap.radius + 0.5 * (hand.joint.radius() + finger.joint.radius()),
+        );
+        let finger_angle = (hand_angle + second_angle).min(144.0f64.to_radians());
+        let positive = Self::wrap_direction_score(
+            pose, cap, wrist, hand, finger, hand_angle, finger_angle)?;
+        let negative = Self::wrap_direction_score(
+            pose, cap, wrist, hand, finger, -hand_angle, -finger_angle)?;
+        let existing =
+            Self::signed_wrap_angle(pose, cap, pose[wrist], pose[finger]);
+        let direction = if positive > negative + 1e-9 {
+            1.0
+        } else if negative > positive + 1e-9 {
+            -1.0
+        } else if existing.abs() > 1e-6 {
+            existing.signum()
+        } else {
+            1.0
+        };
+        let (selected_writhe, alternate_writhe) = if direction > 0.0 {
+            (positive, negative)
+        } else {
+            (negative, positive)
+        };
+        Some(RuntimeWrapPlan {
+            hand_wrap: direction * hand_angle,
+            finger_wrap: direction * finger_angle,
+            selected_writhe,
+            alternate_writhe,
+        })
+    }
+
+    pub fn query_grip_candidate(
+        &self,
+        state: &SolverState,
+        hand: PlayerJoint,
+        palm: V3,
+        palm_aim: V3,
+        max_gap: f64,
+        _min_alignment: f64,
+    ) -> Option<GripCandidate> {
+        if !matches!(hand.joint, Joint::LeftHand | Joint::RightHand)
+            || !palm.is_finite()
+            || !palm_aim.is_finite()
+            || !max_gap.is_finite()
+            || max_gap <= 0.0
+        {
+            return None;
+        }
+        let aim = palm_aim.normalized(1e-9)?;
+        let (wrist, finger) = Self::hand_chain(hand)?;
+        let mut best: Option<GripCandidate> = None;
+        for (capsule, cap) in self.caps.iter().enumerate() {
+            if !can_grip(hand, cap) {
+                continue;
+            }
+            let (wrist_axis, _) = gm_core::closest_point_on_segment(
+                state.pose[wrist],
+                state.pose[cap.a()],
+                state.pose[cap.b()],
+            );
+            let surface_gap =
+                (state.pose[wrist].distance(wrist_axis) - cap.radius - wrist.joint.radius()).max(0.0);
+            if surface_gap > max_gap {
+                continue;
+            }
+            let Some(plan) =
+                Self::plan_runtime_wrap(&state.pose, cap, wrist, hand, finger)
+            else {
+                continue;
+            };
+            let outward = (state.pose[wrist] - wrist_axis)
+                .normalized(1e-9)
+                .unwrap_or(-aim);
+            let closest = wrist_axis + outward * cap.radius;
+            let palm_alignment = (closest - palm).normalized(1e-9).unwrap_or(aim).dot(aim);
+            let wrap_alignment = (plan.selected_writhe / 0.35).clamp(0.0, 1.0);
+            let proximity = 1.0 - surface_gap / max_gap;
+            let score = 0.82 * proximity + 0.18 * wrap_alignment;
+            let candidate = GripCandidate {
+                capsule,
+                player: cap.player,
+                ends: cap.ends,
+                closest,
+                surface_gap,
+                palm_alignment,
+                wrap_alignment,
+                score,
+            };
+            if best.map_or(true, |current| {
+                score > current.score + 1e-12
+                    || ((score - current.score).abs() <= 1e-12 && capsule < current.capsule)
+            }) {
+                best = Some(candidate);
+            }
+        }
+        best
+    }
+
+    pub fn begin_runtime_grip(
+        &mut self,
+        state: &mut SolverState,
+        hand: PlayerJoint,
+        capsule: usize,
+        max_gap: f64,
+    ) -> bool {
+        if !matches!(hand.joint, Joint::LeftHand | Joint::RightHand) {
+            return false;
+        }
+        let Some(cap) = self.caps.get(capsule) else { return false; };
+        if !can_grip(hand, cap) {
+            return false;
+        }
+        let Some((wrist, finger)) = Self::hand_chain(hand) else { return false; };
+        let (wrist_anchor, _) = gm_core::closest_point_on_segment(
+            state.pose[wrist], state.pose[cap.a()], state.pose[cap.b()]);
+        let wrist_gap =
+            (state.pose[wrist].distance(wrist_anchor) - cap.radius - wrist.joint.radius()).max(0.0);
+        if !wrist_gap.is_finite() || wrist_gap > max_gap {
+            return false;
+        }
+        let Some(plan) = Self::plan_runtime_wrap(&state.pose, cap, wrist, hand, finger) else {
+            return false;
+        };
+
+        self.end_runtime_grip(state, hand);
+        let replacement = self.grips.iter().enumerate().find_map(|(index, grip)| {
+            (grip.runtime && state.broken_grips & (1 << index) != 0).then_some(index)
+        });
+        let surface_radius = cap.radius + hand.joint.radius() + RUNTIME_GRIP_SLACK;
+        let grip = Grip {
+            joint: hand,
+            cap: capsule,
+            len: surface_radius,
+            runtime: true,
+            wrist: Some(wrist),
+            finger: Some(finger),
+            finger_len: cap.radius + finger.joint.radius() + RUNTIME_GRIP_SLACK,
+            hand_wrap: plan.hand_wrap,
+            target_wrap: plan.finger_wrap,
+            selected_writhe: plan.selected_writhe,
+            alternate_writhe: plan.alternate_writhe,
+        };
+        let index = if let Some(index) = replacement {
+            self.grips[index] = grip;
+            index
+        } else {
+            if self.grips.len() >= 32 {
+                return false;
+            }
+            self.grips.push(grip);
+            self.grips.len() - 1
+        };
+        state.broken_grips &= !(1 << index);
+        state.grip_strain[index] = 0.0;
+        state.grip_release[index] = 0.0;
+        state.grip_wrap[index] = 0.0;
+        state.grip_contact[index] = 0.0;
+        state.grip_coverage[index] = 0.0;
+        state.grip_strength[index] = 0.0;
+        state.grip_contact_bits[index] = 0;
+        state.grip_anchor_axis[index] = V3::ZERO;
+        state.grip_hand_anchor_s[index] = 0.0;
+        state.grip_hand_anchor_radial[index] = V3::ZERO;
+        state.grip_finger_anchor_s[index] = 0.0;
+        state.grip_finger_anchor_radial[index] = V3::ZERO;
+        true
+    }
+
+    pub fn end_runtime_grip(&self, state: &mut SolverState, hand: PlayerJoint) -> bool {
+        let mut ended = false;
+        for (index, grip) in self.grips.iter().enumerate() {
+            if grip.runtime && grip.joint == hand && state.broken_grips & (1 << index) == 0 {
+                state.broken_grips |= 1 << index;
+                state.grip_strain[index] = 0.0;
+                state.grip_wrap[index] = 0.0;
+                state.grip_contact[index] = 0.0;
+                state.grip_coverage[index] = 0.0;
+                state.grip_strength[index] = 0.0;
+                state.grip_contact_bits[index] = 0;
+                ended = true;
+            }
+        }
+        ended
+    }
+
+    pub fn release_runtime_grips(&self, state: &mut SolverState) {
+        for (index, grip) in self.grips.iter().enumerate() {
+            if grip.runtime {
+                state.broken_grips |= 1 << index;
+                state.grip_strain[index] = 0.0;
+                state.grip_wrap[index] = 0.0;
+                state.grip_contact[index] = 0.0;
+                state.grip_coverage[index] = 0.0;
+                state.grip_strength[index] = 0.0;
+                state.grip_contact_bits[index] = 0;
+            }
+        }
+    }
+
+    pub fn runtime_grip_state(
+        &self,
+        state: &SolverState,
+        hand: PlayerJoint,
+    ) -> Option<RuntimeGripState> {
+        self.grips.iter().enumerate().rev().find_map(|(index, grip)| {
+            if !grip.runtime || grip.joint != hand {
+                return None;
+            }
+            let cap = &self.caps[grip.cap];
+            let broken = state.broken_grips & (1 << index) != 0;
+            Some(RuntimeGripState {
+                active: !broken,
+                broken,
+                capsule: grip.cap,
+                player: cap.player,
+                ends: cap.ends,
+                strain: state.grip_strain[index],
+                release: state.grip_release[index],
+                wrap: state.grip_wrap[index],
+                contact: state.grip_contact[index],
+                coverage: state.grip_coverage[index],
+                strength: state.grip_strength[index],
+                direction: grip.target_wrap.signum(),
+                selected_writhe: grip.selected_writhe,
+                alternate_writhe: grip.alternate_writhe,
+            })
+        })
     }
 
     pub fn grip_count(&self) -> usize {
@@ -877,6 +1449,16 @@ impl Solver {
         for _ in 0..substeps {
             let entry_pose = st.pose;
 
+            for (i, grip) in self.grips.iter().enumerate() {
+                if grip.runtime
+                    && st.broken_grips & (1 << i) == 0
+                    && st.grip_wrap[i] < 1.0
+                {
+                    st.grip_wrap[i] =
+                        (st.grip_wrap[i] + RUNTIME_WRAP_RATE * dt_s).min(1.0);
+                }
+            }
+
             // -- Integrate: velocity (damped) predicts positions.
             let damp = (-self.config.damping * dt_s).exp();
             for pj in PlayerJoint::all() {
@@ -978,6 +1560,15 @@ impl Solver {
                 if st.broken_grips & (1 << i) != 0 {
                     continue;
                 }
+                // A held live grip is an explicit controller command, not a
+                // finite authored-pose tether. Once any wrap point captures
+                // contact it stays full-strength until button release; load,
+                // coverage, and coordinated peeling cannot pay it out.
+                if g.runtime {
+                    st.grip_strain[i] = 0.0;
+                    st.grip_release[i] = 0.0;
+                    continue;
+                }
                 let cap = &self.caps[g.cap];
                 let (anchor, _) = gm_core::closest_point_on_segment(
                     st.pose[g.joint],
@@ -994,7 +1585,8 @@ impl Solver {
                     };
                     let strain = &mut st.grip_strain[i];
                     *strain = (*strain + stretch) * (-GRIP_STRAIN_DECAY * dt_s).exp();
-                    if *strain > GRIP_STRENGTH || *release > GRIP_FAIL_LATCH {
+                    let strength = GRIP_STRENGTH;
+                    if *strain > strength || *release > GRIP_FAIL_LATCH {
                         *release += GRIP_RELEASE_RATE * dt_s;
                     }
                 } else {
@@ -1018,7 +1610,24 @@ impl Solver {
             // -- Constraint iterations.
             for _ in 0..self.config.iterations {
                 self.project_bones(&mut st.pose, &inv_mass);
-                self.project_grips(&mut st.pose, &grip_active, &st.grip_release, &inv_mass);
+                self.project_runtime_wraps(
+                    &mut st.pose,
+                    &grip_active,
+                    &st.grip_wrap,
+                    &st.grip_contact_bits,
+                    dt_s / self.config.iterations.max(1) as f64,
+                );
+                self.project_grips(
+                    &mut st.pose,
+                    &grip_active,
+                    &st.grip_release,
+                    &st.grip_contact_bits,
+                    &st.grip_hand_anchor_s,
+                    &st.grip_hand_anchor_radial,
+                    &st.grip_finger_anchor_s,
+                    &st.grip_finger_anchor_radial,
+                    &inv_mass,
+                );
                 project_hinge_min_angles(&mut st.pose, &inv_mass);
                 project_hyperextension_guards(&mut st, &inv_mass);
                 let before_ankle_projection = st.pose;
@@ -1062,6 +1671,7 @@ impl Solver {
             // with floor, contact, and bone constraints.
             self.clamp_arena(&mut st.pose, &inv_mass);
             self.lift_unpinned_pose_to_mat(&mut st.pose);
+            self.update_runtime_grip_quality(&mut st, dt_s, &mut grip_active);
 
             // -- Velocity update from actual displacement.
             for pj in PlayerJoint::all() {
@@ -1075,7 +1685,13 @@ impl Solver {
             //    along the tether, or every positional snap-back converts into
             //    velocity that the next substep amplifies (an energy pump that
             //    slowly shakes tightly-entangled poses apart).
-            self.damp_grip_velocities(&st.pose, &grip_active, &st.grip_release, &mut st.velocity);
+            self.damp_grip_velocities(
+                &st.pose,
+                &grip_active,
+                &st.grip_release,
+                &st.grip_wrap,
+                &mut st.velocity,
+            );
 
             // The soft release correction is a controlled angular servo, not
             // momentum to integrate again next substep. Critically damp its
@@ -1140,6 +1756,170 @@ impl Solver {
         }
     }
 
+    fn project_runtime_wraps(
+        &self,
+        pose: &mut Pose,
+        active: &[bool],
+        wrap: &[f64; 32],
+        contact_bits: &[u8; 32],
+        dt: f64,
+    ) {
+        let max_move = RUNTIME_WRAP_SPEED * dt;
+        for (i, (grip, &on)) in self.grips.iter().zip(active).enumerate() {
+            if !on || !grip.runtime || contact_bits[i] & 0b11 == 0b11 {
+                continue;
+            }
+            let Some(wrist) = grip.wrist else { continue; };
+            let Some(finger) = grip.finger else { continue; };
+            let cap = &self.caps[grip.cap];
+            let a = pose[cap.a()];
+            let b = pose[cap.b()];
+            let Some(axis) = (b - a).normalized(1e-9) else { continue; };
+            let (wrist_axis, _) = gm_core::closest_point_on_segment(pose[wrist], a, b);
+            let wrist_radial = (pose[wrist] - wrist_axis)
+                .normalized(1e-9)
+                .unwrap_or_else(|| axis.cross(V3::Y).normalized_or_zero());
+            if wrist_radial.length_squared() < 1e-12 {
+                continue;
+            }
+            let (hand_axis, _) = gm_core::closest_point_on_segment(pose[grip.joint], a, b);
+            let eased = wrap[i] * wrap[i] * (3.0 - 2.0 * wrap[i]);
+            let hand_radial =
+                Self::rotate_radial(wrist_radial, axis, grip.hand_wrap * eased);
+            let finger_radial =
+                Self::rotate_radial(wrist_radial, axis, grip.target_wrap * eased);
+            let (finger_axis, _) = gm_core::closest_point_on_segment(pose[finger], a, b);
+            let hand_target = hand_axis + hand_radial * grip.len;
+            let finger_target = finger_axis + finger_radial * grip.finger_len;
+            let hand_point = pose[grip.joint];
+            let finger_point = pose[finger];
+
+            if contact_bits[i] & 0b01 == 0 {
+                pose[grip.joint] += (hand_target - hand_point).clamped_len(max_move);
+            }
+            if contact_bits[i] & 0b10 == 0 {
+                pose[finger] += (finger_target - finger_point).clamped_len(max_move);
+            }
+        }
+    }
+
+    fn rotate_between_axes(value: V3, from: V3, to: V3) -> V3 {
+        let cosine = from.dot(to).clamp(-1.0, 1.0);
+        let cross = from.cross(to);
+        let sine = cross.length();
+        if sine < 1e-9 {
+            return if cosine >= 0.0 { value } else { -value };
+        }
+        let axis = cross / sine;
+        // Rodrigues rotation by the shortest arc from the previous capsule
+        // axis to its current axis.
+        value * cosine + axis.cross(value) * sine
+            + axis * (axis.dot(value) * (1.0 - cosine))
+    }
+
+    fn update_runtime_grip_quality(
+        &self,
+        state: &mut SolverState,
+        _dt: f64,
+        active: &mut [bool],
+    ) {
+        for (i, grip) in self.grips.iter().enumerate() {
+            if !grip.runtime || state.broken_grips & (1 << i) != 0 {
+                continue;
+            }
+            let Some(wrist) = grip.wrist else { continue; };
+            let Some(finger) = grip.finger else { continue; };
+            let cap = &self.caps[grip.cap];
+            let gap = |joint: PlayerJoint| {
+                let (axis_point, _) = gm_core::closest_point_on_segment(
+                    state.pose[joint], state.pose[cap.a()], state.pose[cap.b()]);
+                (state.pose[joint].distance(axis_point) - cap.radius - joint.joint.radius()).max(0.0)
+            };
+            let wrist_gap = gap(wrist);
+            let hand_gap = gap(grip.joint);
+            let finger_gap = gap(finger);
+            if state.grip_contact_bits[i] == 0 && wrist_gap > RUNTIME_WRAP_ABORT_GAP {
+                state.broken_grips |= 1 << i;
+                active[i] = false;
+                continue;
+            }
+
+            let cap_a = state.pose[cap.a()];
+            let cap_b = state.pose[cap.b()];
+            let Some(axis) = (cap_b - cap_a).normalized(1e-9) else { continue; };
+            let previous_axis = state.grip_anchor_axis[i];
+            if state.grip_contact_bits[i] != 0
+                && previous_axis.length_squared() > 1e-12
+            {
+                state.grip_hand_anchor_radial[i] = Self::rotate_between_axes(
+                    state.grip_hand_anchor_radial[i], previous_axis, axis);
+                state.grip_finger_anchor_radial[i] = Self::rotate_between_axes(
+                    state.grip_finger_anchor_radial[i], previous_axis, axis);
+            }
+            state.grip_anchor_axis[i] = axis;
+
+            if state.grip_contact_bits[i] & 0b01 == 0
+                && hand_gap <= RUNTIME_STICKY_CAPTURE_GAP
+            {
+                let (anchor, s) = gm_core::closest_point_on_segment(
+                    state.pose[grip.joint], cap_a, cap_b);
+                state.grip_hand_anchor_s[i] = s;
+                state.grip_hand_anchor_radial[i] = state.pose[grip.joint] - anchor;
+                state.grip_contact_bits[i] |= 0b01;
+            }
+            if state.grip_contact_bits[i] & 0b10 == 0
+                && finger_gap <= RUNTIME_STICKY_CAPTURE_GAP
+            {
+                let (anchor, s) = gm_core::closest_point_on_segment(
+                    state.pose[finger], cap_a, cap_b);
+                state.grip_finger_anchor_s[i] = s;
+                state.grip_finger_anchor_radial[i] = state.pose[finger] - anchor;
+                state.grip_contact_bits[i] |= 0b10;
+            }
+
+            let achieved =
+                Self::signed_wrap_angle(&state.pose, cap, state.pose[wrist], state.pose[finger]);
+            let raw_coverage =
+                (achieved * grip.target_wrap.signum() / grip.target_wrap.abs().max(1e-9))
+                    .clamp(0.0, 1.0);
+            state.grip_coverage[i] = raw_coverage;
+            state.grip_contact[i] =
+                state.grip_contact_bits[i].count_ones() as f64 * 0.5;
+            state.grip_strength[i] = if state.grip_contact_bits[i] == 0 {
+                0.0
+            } else {
+                RUNTIME_GRIP_STRENGTH
+            };
+        }
+    }
+
+    fn project_grip_point(
+        pose: &mut Pose,
+        joint: PlayerJoint,
+        cap: &CapsuleDef,
+        len: f64,
+        stiffness: f64,
+        inv_mass: &dyn Fn(PlayerJoint) -> f64,
+    ) {
+        let (ea, eb) = (cap.a(), cap.b());
+        let (anchor, s) = gm_core::closest_point_on_segment(pose[joint], pose[ea], pose[eb]);
+        let delta = pose[joint] - anchor;
+        let dist = delta.length();
+        if dist <= len + 1e-9 || dist < 1e-9 {
+            return;
+        }
+        let n = delta / dist;
+        let (wj, wa, wb) = (inv_mass(joint), inv_mass(ea), inv_mass(eb));
+        let denom = wj + wa * (1.0 - s) * (1.0 - s) + wb * s * s;
+        if denom < 1e-12 {
+            return;
+        }
+        let lambda = (dist - len) / denom * stiffness.clamp(0.0, 1.0);
+        pose[joint] -= n * (lambda * wj);
+        pose[ea] += n * (lambda * wa * (1.0 - s));
+        pose[eb] += n * (lambda * wb * s);
+    }
+
     /// Grips as unilateral tethers: a gripping joint may not move farther
     /// from the gripped capsule's *segment* than it was at load (the closest
     /// point is re-evaluated every iteration, so the grip slides freely along
@@ -1152,73 +1932,131 @@ impl Solver {
         pose: &mut Pose,
         active: &[bool],
         release: &[f64; 32],
+        contact_bits: &[u8; 32],
+        hand_anchor_s: &[f64; 32],
+        hand_anchor_radial: &[V3; 32],
+        finger_anchor_s: &[f64; 32],
+        finger_anchor_radial: &[V3; 32],
         inv_mass: &dyn Fn(PlayerJoint) -> f64,
     ) {
         for (i, (g, &on)) in self.grips.iter().zip(active).enumerate() {
             if !on {
                 continue;
             }
-            let len = g.len + release[i];
             let cap = &self.caps[g.cap];
-            let (ea, eb) = (cap.a(), cap.b());
-            let (anchor, s) = gm_core::closest_point_on_segment(pose[g.joint], pose[ea], pose[eb]);
-            let delta = pose[g.joint] - anchor;
-            let dist = delta.length();
-            if dist <= len + 1e-9 || dist < 1e-9 {
+            if g.runtime {
+                if contact_bits[i] & 0b01 != 0 {
+                    Self::project_sticky_grip_point(
+                        pose, g.joint, cap, hand_anchor_s[i],
+                        hand_anchor_radial[i], inv_mass);
+                }
+                if contact_bits[i] & 0b10 != 0 {
+                    if let Some(finger) = g.finger {
+                        Self::project_sticky_grip_point(
+                            pose, finger, cap, finger_anchor_s[i],
+                            finger_anchor_radial[i], inv_mass);
+                    }
+                }
                 continue;
             }
-            let n = delta / dist;
-            let (wj, wa, wb) = (inv_mass(g.joint), inv_mass(ea), inv_mass(eb));
-            let denom = wj + wa * (1.0 - s) * (1.0 - s) + wb * s * s;
-            if denom < 1e-12 {
-                continue;
+            Self::project_grip_point(
+                pose, g.joint, cap, g.len + release[i], 1.0, inv_mass);
+            if let Some(finger) = g.finger {
+                Self::project_grip_point(
+                    pose,
+                    finger,
+                    cap,
+                    g.finger_len + release[i],
+                    1.0,
+                    inv_mass,
+                );
             }
-            let lambda = (dist - len) / denom;
-            pose[g.joint] -= n * (lambda * wj);
-            pose[ea] += n * (lambda * wa * (1.0 - s));
-            pose[eb] += n * (lambda * wb * s);
         }
+    }
+
+    fn project_sticky_grip_point(
+        pose: &mut Pose,
+        joint: PlayerJoint,
+        cap: &CapsuleDef,
+        s: f64,
+        radial: V3,
+        inv_mass: &dyn Fn(PlayerJoint) -> f64,
+    ) {
+        let (ea, eb) = (cap.a(), cap.b());
+        let s = s.clamp(0.0, 1.0);
+        let target = pose[ea] * (1.0 - s) + pose[eb] * s + radial;
+        let error = pose[joint] - target;
+        if error.length_squared() < 1e-18 {
+            return;
+        }
+        let (wj, wa, wb) = (inv_mass(joint), inv_mass(ea), inv_mass(eb));
+        let denom = wj + wa * (1.0 - s) * (1.0 - s) + wb * s * s;
+        if denom < 1e-12 {
+            return;
+        }
+        pose[joint] -= error * (wj / denom);
+        pose[ea] += error * (wa * (1.0 - s) / denom);
+        pose[eb] += error * (wb * s / denom);
     }
 
     /// Remove the separating component of relative velocity across each taut
     /// grip (see the call site). Approaching velocity is untouched - grips
     /// only ever resist separation.
+    fn damp_grip_point(
+        pose: &Pose,
+        joint: PlayerJoint,
+        cap: &CapsuleDef,
+        len: f64,
+        velocity: &mut [[V3; gm_core::JOINT_COUNT]; gm_core::PLAYER_COUNT],
+    ) {
+        let (ea, eb) = (cap.a(), cap.b());
+        let (anchor, s) = gm_core::closest_point_on_segment(pose[joint], pose[ea], pose[eb]);
+        let delta = pose[joint] - anchor;
+        let dist = delta.length();
+        if dist < len - 0.005 || dist < 1e-9 {
+            return;
+        }
+        let n = delta / dist;
+        let vj = velocity[joint.player.index()][joint.joint.index()];
+        let va = velocity[ea.player.index()][ea.joint.index()];
+        let vb = velocity[eb.player.index()][eb.joint.index()];
+        let v_anchor = va * (1.0 - s) + vb * s;
+        let sep = (vj - v_anchor).dot(n);
+        if sep <= 0.0 {
+            return;
+        }
+        let mj = joint.joint.mass();
+        let ma = ea.joint.mass() * (1.0 - s) + eb.joint.mass() * s;
+        let total = mj + ma;
+        velocity[joint.player.index()][joint.joint.index()] -= n * (sep * ma / total);
+        let up = n * (sep * mj / total);
+        velocity[ea.player.index()][ea.joint.index()] += up * (1.0 - s);
+        velocity[eb.player.index()][eb.joint.index()] += up * s;
+    }
+
     fn damp_grip_velocities(
         &self,
         pose: &Pose,
         active: &[bool],
         release: &[f64; 32],
+        wrap: &[f64; 32],
         velocity: &mut [[V3; gm_core::JOINT_COUNT]; gm_core::PLAYER_COUNT],
     ) {
         for (i, (g, &on)) in self.grips.iter().zip(active).enumerate() {
-            if !on {
+            if !on || (g.runtime && wrap[i] < 1.0) {
                 continue;
             }
             let cap = &self.caps[g.cap];
-            let (ea, eb) = (cap.a(), cap.b());
-            let (anchor, s) = gm_core::closest_point_on_segment(pose[g.joint], pose[ea], pose[eb]);
-            let delta = pose[g.joint] - anchor;
-            let dist = delta.length();
-            if dist < g.len + release[i] - 0.005 || dist < 1e-9 {
-                continue;
+            Self::damp_grip_point(pose, g.joint, cap, g.len + release[i], velocity);
+            if let Some(finger) = g.finger {
+                Self::damp_grip_point(
+                    pose,
+                    finger,
+                    cap,
+                    g.finger_len + release[i],
+                    velocity,
+                );
             }
-            let n = delta / dist;
-            let vj = velocity[g.joint.player.index()][g.joint.joint.index()];
-            let va = velocity[ea.player.index()][ea.joint.index()];
-            let vb = velocity[eb.player.index()][eb.joint.index()];
-            let v_anchor = va * (1.0 - s) + vb * s;
-            let sep = (vj - v_anchor).dot(n);
-            if sep <= 0.0 {
-                continue;
-            }
-            // Split the impulse between the joint and the anchor by mass.
-            let mj = g.joint.joint.mass();
-            let ma = ea.joint.mass() * (1.0 - s) + eb.joint.mass() * s;
-            let total = mj + ma;
-            velocity[g.joint.player.index()][g.joint.joint.index()] -= n * (sep * ma / total);
-            let up = n * (sep * mj / total);
-            velocity[ea.player.index()][ea.joint.index()] += up * (1.0 - s);
-            velocity[eb.player.index()][eb.joint.index()] += up * s;
         }
     }
 

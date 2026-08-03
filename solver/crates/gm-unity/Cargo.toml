@@ -1,0 +1,16 @@
+[package]
+name = "gm-unity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+gm-core = { workspace = true }
+gm-solver = { workspace = true }
+gm-topology = { workspace = true }
+gm-validate = { workspace = true }
+serde_json = { workspace = true }
+

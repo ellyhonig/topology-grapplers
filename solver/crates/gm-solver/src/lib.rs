@@ -16,7 +16,7 @@ pub mod tone;
 
 pub use config::SolverConfig;
 pub use effector::Effector;
-pub use solver::{Solver, StepDiagnostics};
+pub use solver::{Solver, StepDiagnostics, RUNTIME_GRIP_STRENGTH};
 pub use state::SolverState;
 
 #[cfg(test)]

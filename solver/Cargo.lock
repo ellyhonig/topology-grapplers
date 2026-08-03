@@ -132,6 +132,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gm-unity"
+version = "0.1.0"
+dependencies = [
+ "gm-core",
+ "gm-solver",
+ "gm-topology",
+ "gm-validate",
+ "serde_json",
+]
+
+[[package]]
 name = "gm-validate"
 version = "0.1.0"
 dependencies = [
